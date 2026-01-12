@@ -3,3 +3,4 @@ claude.md
 .DS_Store
 **.pyc
 __pycache__/*
+*.egg-info/*
