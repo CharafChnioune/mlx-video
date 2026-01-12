@@ -14,7 +14,7 @@ from mlx_video.utils import to_denoised
 from mlx_video.models.ltx.video_vae.decoder import load_vae_decoder
 from mlx_video.models.ltx.upsampler import load_upsampler, upsample_latents
 
-from huggingface_hub import snapshot_download
+from mlx_video.utils import get_model_path
 
 
 # Distilled sigma schedules
@@ -93,20 +93,6 @@ def create_position_grid(
     pixel_coords[:, 0, :, :] = pixel_coords[:, 0, :, :] / fps
 
     return mx.array(pixel_coords, dtype=mx.float32)
-
-
-def get_model_path(model_repo: str):
-    """Get or download LTX-2 model path."""
-    try:
-        return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
-    except Exception:
-        print("Downloading LTX-2 model weights...")
-        return Path(snapshot_download(
-            repo_id=model_repo,
-            local_files_only=False,
-            resume_download=True,
-            allow_patterns=["*.safetensors", "*.json"],
-        ))
 
 
 def denoise(
