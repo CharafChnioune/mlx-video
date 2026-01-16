@@ -883,7 +883,7 @@ class LTX2TextEncoder(nn.Module):
         )
         input_ids = mx.array(inputs["input_ids"])
 
-        sampler = make_sampler(kwargs.get("temperature", 0.7), kwargs.get("top_p", 0.95), top_k=kwargs.get("top_k", -1))
+        sampler = make_sampler(kwargs.get("temperature", 0.7), kwargs.get("top_p", 1.0), top_k=kwargs.get("top_k", -1))
         logits_processors = make_logits_processors(
             kwargs.get("logit_bias", None),
             kwargs.get("repetition_penalty", 1.3),
