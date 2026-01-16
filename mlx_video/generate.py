@@ -265,7 +265,7 @@ def generate_video(
 
     vae_decoder = load_vae_decoder(
         str(model_path / 'ltx-2-19b-distilled.safetensors'),
-        timestep_conditioning=True
+        timestep_conditioning=None  # Auto-detect from model metadata
     )
 
     latents = upsample_latents(latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
