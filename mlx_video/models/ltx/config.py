@@ -123,7 +123,7 @@ class LTXModelConfig(BaseModelConfig):
 
     # Timestep config
     timestep_scale_multiplier: int = 1000
-    av_ca_timestep_scale_multiplier: int = 1
+    av_ca_timestep_scale_multiplier: int = 1000
 
     # Normalization
     norm_eps: float = 1e-6

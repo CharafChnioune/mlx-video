@@ -463,7 +463,7 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
         positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
         audio_positional_embedding_max_pos=config.get("audio_positional_embedding_max_pos", [20]),
         timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
-        av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1),
+        av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1000),
         norm_eps=config.get("norm_eps", 1e-6),
     )
 
