@@ -1295,8 +1295,10 @@ def generate_video(
         console.print(f"[green]✅ Saved {len(video_np)} frames to {frames_dir}[/]")
 
     elapsed = time.time() - start_time
+    minutes, seconds = divmod(elapsed, 60)
+    time_str = f"{int(minutes)}m {seconds:.1f}s" if minutes >= 1 else f"{seconds:.1f}s"
     console.print(Panel(
-        f"[bold green]🎉 Done![/] Generated in {elapsed:.1f}s ({elapsed/num_frames:.2f}s/frame)\n"
+        f"[bold green]🎉 Done![/] Generated in {time_str} ({elapsed/num_frames:.2f}s/frame)\n"
         f"[bold green]✨ Peak memory:[/] {mx.get_peak_memory() / (1024 ** 3):.2f}GB",
         expand=False
     ))
