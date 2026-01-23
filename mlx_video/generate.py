@@ -1375,7 +1375,6 @@ Examples:
     parser.add_argument("--stream", action="store_true", help="Stream frames to output as they're decoded")
     parser.add_argument("--audio", "-a", action="store_true", help="Enable synchronized audio generation")
     parser.add_argument("--output-audio", type=str, default=None, help="Output audio path")
-
     args = parser.parse_args()
 
     pipeline = PipelineType.DEV if args.pipeline == "dev" else PipelineType.DISTILLED
