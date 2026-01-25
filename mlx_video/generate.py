@@ -924,7 +924,7 @@ def generate_video(
 
         config = LTXModelConfig(**config_kwargs)
 
-        transformer = LTXModel.from_pretrained(model_path=model_path/weight_file, config=config, strict=True)
+        transformer = LTXModel.from_pretrained(model_path=model_path/weight_file, config=config, strict=False)
 
     console.print("[green]✓[/] Transformer loaded")
 
