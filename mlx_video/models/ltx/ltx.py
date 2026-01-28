@@ -532,9 +532,65 @@ class LTXModel(nn.Module):
         for weight_file in model_path:
             weights.update(mx.load(str(weight_file)))
 
+        # Detect PyTorch vs MLX weight format
+        is_pytorch = any(k.startswith("model.diffusion_model.") for k in weights)
+        if is_pytorch:
+            sanitized = model.sanitize(weights)
+        else:
+            sanitized = weights
 
-        sanitized = model.sanitize(weights)
-        sanitized = {k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v for k, v in sanitized.items()}
+        # If quantized weights are present, configure quantization before loading
+        has_quant = any(k.endswith(".scales") or k.endswith(".biases") for k in sanitized)
+        if has_quant:
+            # Default quant settings; override if quantization.json exists
+            group_size = 64
+            bits = 4
+            mode = "affine"
+            predicate = "scales"
+            try:
+                meta_path = Path(model_path[0]).parent / "quantization.json"
+                if meta_path.exists():
+                    import json
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    group_size = int(meta.get("group_size", group_size))
+                    bits = int(meta.get("bits", bits))
+                    mode = meta.get("mode", mode)
+                    predicate = meta.get("predicate", predicate)
+            except Exception:
+                pass
+
+            def _attn1_only_predicate(p, m):
+                if not hasattr(m, "to_quantized"):
+                    return False
+                if "transformer_blocks" not in p:
+                    return False
+                if "audio_" in p or "audio_to_video" in p or "video_to_audio" in p:
+                    return False
+                if ".attn1" not in p:
+                    return False
+                return True
+
+            def _scales_predicate(p, m):
+                return f"{p}.scales" in sanitized
+
+            pred = _attn1_only_predicate if predicate == "attn1_only" else _scales_predicate
+
+            nn.quantize(
+                model,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                class_predicate=pred,
+            )
+
+            # For quantized weights, keep scale/bias dtype as saved, cast others to bfloat16
+            sanitized = {
+                k: (v.astype(mx.bfloat16) if v.dtype == mx.float32 else v)
+                for k, v in sanitized.items()
+            }
+        else:
+            sanitized = {k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v for k, v in sanitized.items()}
 
         model.load_weights(list(sanitized.items()), strict=strict)
         mx.eval(model.parameters())

@@ -697,6 +697,8 @@ def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RA
     if audio.ndim == 2:
         audio = audio.T
 
+    # Clamp and sanitize to avoid NaN/Inf propagating into the WAV
+    audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
     audio = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio * 32767).astype(np.int16)
 
@@ -833,8 +835,10 @@ def generate_video(
     model_path = get_model_path(model_repo)
     text_encoder_path = model_path if text_encoder_repo is None else get_model_path(text_encoder_repo)
 
-    # Model weight file
+    # Model weight file (base PyTorch weights) and optional MLX-converted transformer
     weight_file = "ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors"
+    mlx_weight_file = model_path / f"ltx-2-19b-{'dev' if pipeline == PipelineType.DEV else 'distilled'}-mlx.safetensors"
+    transformer_weight_path = mlx_weight_file if mlx_weight_file.exists() else model_path / weight_file
 
     # Calculate latent dimensions
     if pipeline == PipelineType.DISTILLED:
@@ -924,7 +928,7 @@ def generate_video(
 
         config = LTXModelConfig(**config_kwargs)
 
-        transformer = LTXModel.from_pretrained(model_path=model_path/weight_file, config=config, strict=False)
+        transformer = LTXModel.from_pretrained(model_path=transformer_weight_path, config=config, strict=True)
 
     console.print("[green]✓[/] Transformer loaded")
 

@@ -9,6 +9,7 @@ from huggingface_hub import snapshot_download
 
 from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType
 from mlx_video.models.ltx.ltx import LTXModel
+from mlx_video.models.ltx.attention import Attention
 
 
 def get_model_path(
@@ -530,6 +531,8 @@ def convert(
     quantize: bool = False,
     q_bits: int = 4,
     q_group_size: int = 64,
+    q_mode: str = "affine",
+    pipeline: str = "dev",
 ) -> Path:
     """Convert HuggingFace model to MLX format.
 
@@ -550,13 +553,18 @@ def convert(
     # Load config
     config = load_config(model_path)
 
-    # Load weights
-    print("Loading weights...")
-    weights = load_safetensors(model_path)
+    # Load transformer weights for the requested pipeline
+    print("Loading transformer weights...")
+    if pipeline not in {"dev", "distilled"}:
+        raise ValueError(f"Unsupported pipeline: {pipeline}")
+    weight_file = model_path / f"ltx-2-19b-{pipeline}.safetensors"
+    if not weight_file.exists():
+        raise FileNotFoundError(f"Missing weight file: {weight_file}")
+    raw_weights = mx.load(str(weight_file))
 
-    # Sanitize weights
-    print("Sanitizing weights...")
-    weights = sanitize_weights(weights)
+    # Sanitize transformer weights only
+    print("Sanitizing transformer weights...")
+    weights = sanitize_transformer_weights(raw_weights)
 
     # Convert dtype if specified
     if dtype is not None:
@@ -572,18 +580,58 @@ def convert(
             for k, v in weights.items()
         }
 
+    # Quantize if requested
+    if quantize:
+        print(f"Quantizing model (group_size={q_group_size}, bits={q_bits}, mode={q_mode})...")
+        model = create_model_from_config(config)
+        model.load_weights(list(weights.items()), strict=False)
+        def _attn1_only_predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            # Quantize only video attention projections
+            if "transformer_blocks" not in path:
+                return False
+            if "audio_" in path or "audio_to_video" in path or "video_to_audio" in path:
+                return False
+            if ".attn1" not in path:
+                return False
+            return True
+
+        nn.quantize(
+            model,
+            group_size=q_group_size,
+            bits=q_bits,
+            mode=q_mode,
+            class_predicate=_attn1_only_predicate,
+        )
+        from mlx.utils import tree_flatten
+        weights = tree_flatten(model.parameters(), destination={})
+
     # Create output directory
     output_path = Path(mlx_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Save weights
-    print(f"Saving weights to {output_path}...")
-    save_weights(output_path, weights)
+    # Save weights (MLX safetensors). This preserves bfloat16 and quantized weights.
+    out_name = f"ltx-2-19b-{pipeline}-mlx.safetensors"
+    print(f"Saving weights to {output_path / out_name}...")
+    mx.save_safetensors(str(output_path / out_name), weights)
 
     # Save config
     config_out_path = output_path / "config.json"
     with open(config_out_path, "w") as f:
         json.dump(config, f, indent=2)
+
+    if quantize:
+        meta = {
+            "group_size": q_group_size,
+            "bits": q_bits,
+            "mode": q_mode,
+            "dtype": dtype or "float16",
+            "pipeline": pipeline,
+            "predicate": "attn1_only",
+        }
+        with open(output_path / "quantization.json", "w") as f:
+            json.dump(meta, f, indent=2)
 
     print(f"Model converted successfully to {output_path}")
     return output_path
@@ -676,6 +724,25 @@ if __name__ == "__main__":
         default=4,
         help="Quantization bits",
     )
+    parser.add_argument(
+        "--q-group-size",
+        type=int,
+        default=64,
+        help="Quantization group size",
+    )
+    parser.add_argument(
+        "--q-mode",
+        type=str,
+        default="affine",
+        help="Quantization mode",
+    )
+    parser.add_argument(
+        "--pipeline",
+        type=str,
+        choices=["dev", "distilled"],
+        default="dev",
+        help="Pipeline weights to convert",
+    )
 
     args = parser.parse_args()
 
@@ -685,4 +752,7 @@ if __name__ == "__main__":
         dtype=args.dtype,
         quantize=args.quantize,
         q_bits=args.q_bits,
+        q_group_size=args.q_group_size,
+        q_mode=args.q_mode,
+        pipeline=args.pipeline,
     )
