@@ -24,8 +24,10 @@ copy_snapshot() {
 echo "==> Copying snapshot assets"
 copy_snapshot "$OUT/ltx2-dev-8bit-mlx"
 copy_snapshot "$OUT/ltx2-dev-4bit-mlx"
+copy_snapshot "$OUT/ltx2-dev-2bit-mlx"
 copy_snapshot "$OUT/ltx2-distilled-8bit-mlx"
 copy_snapshot "$OUT/ltx2-distilled-4bit-mlx"
+copy_snapshot "$OUT/ltx2-distilled-2bit-mlx"
 
 echo "==> Fixing symlinks to HF blobs"
 "$ROOT"/.venv/bin/python - <<PY
@@ -45,7 +47,7 @@ def fix_symlinks(root: Path):
             p.unlink()
             p.symlink_to(abs_target)
 
-for name in ["ltx2-dev-8bit-mlx", "ltx2-dev-4bit-mlx", "ltx2-distilled-8bit-mlx", "ltx2-distilled-4bit-mlx"]:
+for name in ["ltx2-dev-8bit-mlx", "ltx2-dev-4bit-mlx", "ltx2-dev-2bit-mlx", "ltx2-distilled-8bit-mlx", "ltx2-distilled-4bit-mlx", "ltx2-distilled-2bit-mlx"]:
     path = converted / name
     if path.exists():
         fix_symlinks(path)
@@ -68,6 +70,13 @@ echo "==> Converting transformer weights (MLX quantized)"
 
 "$ROOT"/.venv/bin/python -m mlx_video.convert \
   --hf-path "$HF_REPO" \
+  --mlx-path "$OUT/ltx2-dev-2bit-mlx" \
+  --dtype bfloat16 \
+  --quantize --q-bits 2 --q-group-size 64 --q-mode affine \
+  --pipeline dev
+
+"$ROOT"/.venv/bin/python -m mlx_video.convert \
+  --hf-path "$HF_REPO" \
   --mlx-path "$OUT/ltx2-distilled-8bit-mlx" \
   --dtype bfloat16 \
   --quantize --q-bits 8 --q-group-size 64 --q-mode affine \
@@ -78,6 +87,13 @@ echo "==> Converting transformer weights (MLX quantized)"
   --mlx-path "$OUT/ltx2-distilled-4bit-mlx" \
   --dtype bfloat16 \
   --quantize --q-bits 4 --q-group-size 64 --q-mode affine \
+  --pipeline distilled
+
+"$ROOT"/.venv/bin/python -m mlx_video.convert \
+  --hf-path "$HF_REPO" \
+  --mlx-path "$OUT/ltx2-distilled-2bit-mlx" \
+  --dtype bfloat16 \
+  --quantize --q-bits 2 --q-group-size 64 --q-mode affine \
   --pipeline distilled
 
 echo "==> Done"

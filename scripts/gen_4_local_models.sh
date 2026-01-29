@@ -13,8 +13,10 @@ TEXT_ENCODER_REPO_Q="${TEXT_ENCODER_REPO_Q:-Lightricks/LTX-2}"
 
 DEV_8BIT="$CONVERTED/ltx2-dev-8bit-mlx"
 DEV_4BIT="$CONVERTED/ltx2-dev-4bit-mlx"
+DEV_2BIT="$CONVERTED/ltx2-dev-2bit-mlx"
 DIS_8BIT="$CONVERTED/ltx2-distilled-8bit-mlx"
 DIS_4BIT="$CONVERTED/ltx2-distilled-4bit-mlx"
+DIS_2BIT="$CONVERTED/ltx2-distilled-2bit-mlx"
 
 mkdir -p "$OUT"
 
@@ -66,6 +68,18 @@ echo "==> Generating BF16 + 4 local-model videos"
 
 ./.venv/bin/python -m mlx_video.generate \
   --prompt "$PROMPT" \
+  --pipeline dev \
+  --model-repo "$DEV_2BIT" \
+  --text-encoder-repo "$TEXT_ENCODER_REPO_Q" \
+  --width 832 --height 480 \
+  --fps 24 --num-frames 73 \
+  --steps 20 --cfg-scale 4 \
+  --seed 42 \
+  --audio \
+  --output-path "$OUT/test_dev_2bit_audio_5s.mp4"
+
+./.venv/bin/python -m mlx_video.generate \
+  --prompt "$PROMPT" \
   --pipeline distilled \
   --model-repo "$DIS_8BIT" \
   --text-encoder-repo "$TEXT_ENCODER_REPO_Q" \
@@ -87,5 +101,17 @@ echo "==> Generating BF16 + 4 local-model videos"
   --seed 42 \
   --audio \
   --output-path "$OUT/test_distilled_4bit_audio_5s.mp4"
+
+./.venv/bin/python -m mlx_video.generate \
+  --prompt "$PROMPT" \
+  --pipeline distilled \
+  --model-repo "$DIS_2BIT" \
+  --text-encoder-repo "$TEXT_ENCODER_REPO_Q" \
+  --width 832 --height 512 \
+  --fps 24 --num-frames 73 \
+  --steps 8 --cfg-scale 4 \
+  --seed 42 \
+  --audio \
+  --output-path "$OUT/test_distilled_2bit_audio_5s.mp4"
 
 echo "==> Done"
