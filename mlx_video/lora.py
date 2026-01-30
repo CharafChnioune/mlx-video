@@ -32,7 +32,7 @@ def _sanitize_lora_prefix(prefix: str) -> str:
     return prefix
 
 
-def _lora_base_key(lora_key: str) -> str | None:
+def _lora_base_keys(lora_key: str) -> tuple[str, str] | None:
     if not lora_key.endswith(".weight"):
         return None
     if ".lora_A." in lora_key:
@@ -41,7 +41,8 @@ def _lora_base_key(lora_key: str) -> str | None:
         base = lora_key.replace(".lora_B.weight", ".weight")
     else:
         return None
-    return _sanitize_lora_prefix(base)
+    # Keep both raw and sanitized forms to match PyTorch and MLX weights
+    return base, _sanitize_lora_prefix(base)
 
 
 def load_lora_state(path: Path) -> Dict[str, mx.array]:
@@ -55,8 +56,8 @@ def load_lora_state(path: Path) -> Dict[str, mx.array]:
         return weights
 
 
-def _iter_lora_pairs(lora_sd: Dict[str, mx.array]) -> Iterable[Tuple[str, mx.array, mx.array]]:
-    # Yield (base_key, A, B)
+def _iter_lora_pairs(lora_sd: Dict[str, mx.array]) -> Iterable[Tuple[str, str, mx.array, mx.array]]:
+    # Yield (base_key_raw, base_key_sanitized, A, B)
     for key in lora_sd.keys():
         if not key.endswith(".lora_A.weight"):
             continue
@@ -64,10 +65,29 @@ def _iter_lora_pairs(lora_sd: Dict[str, mx.array]) -> Iterable[Tuple[str, mx.arr
         key_b = f"{prefix}.lora_B.weight"
         if key_b not in lora_sd:
             continue
-        base_key = _lora_base_key(key)
-        if base_key is None:
+        base_keys = _lora_base_keys(key)
+        if base_keys is None:
             continue
-        yield base_key, lora_sd[key], lora_sd[key_b]
+        base_raw, base_sanitized = base_keys
+        yield base_raw, base_sanitized, lora_sd[key], lora_sd[key_b]
+
+
+def _candidate_weight_keys(base_raw: str, base_sanitized: str) -> Tuple[str, ...]:
+    candidates = [base_sanitized, base_raw]
+    if base_raw.startswith("diffusion_model."):
+        candidates.append(f"model.{base_raw}")
+    # Also allow raw weights without "model." prefix (rare)
+    if base_sanitized and not base_sanitized.startswith("model."):
+        candidates.append(f"diffusion_model.{base_sanitized}")
+        candidates.append(f"model.diffusion_model.{base_sanitized}")
+    # Preserve order and uniqueness
+    seen = set()
+    ordered = []
+    for key in candidates:
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return tuple(ordered)
 
 
 def apply_lora_to_weights(
@@ -80,11 +100,16 @@ def apply_lora_to_weights(
         lora_sd = load_lora_state(spec.path)
         applied = 0
         skipped = 0
-        for base_key, A, B in _iter_lora_pairs(lora_sd):
-            if base_key not in updated:
+        for base_raw, base_sanitized, A, B in _iter_lora_pairs(lora_sd):
+            weight_key = None
+            for candidate in _candidate_weight_keys(base_raw, base_sanitized):
+                if candidate in updated:
+                    weight_key = candidate
+                    break
+            if weight_key is None:
                 skipped += 1
                 continue
-            w = updated[base_key]
+            w = updated[weight_key]
             # Compute delta = B @ A
             # Cast to float32 for stability, then back to weight dtype
             delta = mx.matmul(B.astype(mx.float32), A.astype(mx.float32)) * spec.strength
@@ -92,10 +117,12 @@ def apply_lora_to_weights(
                 # If convolutional, try to reshape (O, I, H, W) in MLX
                 delta = mx.reshape(delta, w.shape)
             delta = delta.astype(w.dtype)
-            updated[base_key] = w + delta
+            updated[weight_key] = w + delta
             applied += 1
         if verbose:
             print(f"[LoRA] {spec.path} applied={applied} skipped={skipped}")
+        elif applied == 0:
+            print(f"[LoRA] Warning: no weights applied for {spec.path}. Check key mapping.")
     return updated
 
 

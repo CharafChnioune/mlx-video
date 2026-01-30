@@ -154,11 +154,13 @@ def ltx2_scheduler(
 
     # Apply shift transformation
     power = 1
-    sigmas = np.where(
-        sigmas != 0,
-        math.exp(sigma_shift) / (math.exp(sigma_shift) + (1 / sigmas - 1) ** power),
-        0,
-    )
+    # Avoid divide-by-zero warnings by applying the transform only to non-zero sigmas
+    transformed = np.zeros_like(sigmas)
+    non_zero = sigmas != 0
+    if np.any(non_zero):
+        nz = sigmas[non_zero]
+        transformed[non_zero] = math.exp(sigma_shift) / (math.exp(sigma_shift) + (1 / nz - 1) ** power)
+    sigmas = transformed
 
     # Stretch sigmas to terminal value
     if stretch:
@@ -860,8 +862,10 @@ def generate_video(
     assert width % divisor == 0, f"Width must be divisible by {divisor}, got {width}"
 
     if num_frames % 8 != 1:
-        adjusted_num_frames = round((num_frames - 1) / 8) * 8 + 1
-        console.print(f"[yellow]⚠️  Number of frames must be 1 + 8*k. Using: {adjusted_num_frames}[/]")
+        # Always round up to avoid shortening the requested duration
+        adjusted_num_frames = ((num_frames - 1 + 7) // 8) * 8 + 1
+        if verbose:
+            console.print(f"[dim]Adjusted num_frames to {adjusted_num_frames} (1 + 8*k requirement).[/]")
         num_frames = adjusted_num_frames
 
     is_i2v = image is not None
