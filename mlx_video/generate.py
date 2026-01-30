@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from PIL import Image
 from rich.console import Console
@@ -992,21 +993,105 @@ def generate_video(
 
         config = LTXModelConfig(**config_kwargs)
 
+        transformer = None
         weights_override = None
         if loras:
             from mlx_video.lora import LoraSpec, apply_lora_to_weights, has_quantized_weights
             raw_weights = mx.load(str(transformer_weight_path))
             if has_quantized_weights(raw_weights):
-                raise ValueError("LoRA merging is not supported on quantized weights. Bake LoRA during conversion.")
-            lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
-            weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
+                # Quantized weights + per-run LoRA: re-quantize in-memory using float weights
+                float_weight_path = model_path / weight_file
+                if not float_weight_path.exists():
+                    raise ValueError(
+                        f"LoRA on quantized weights requires float weights at {float_weight_path}."
+                    )
+                from mlx_video.convert import sanitize_transformer_weights
+                float_raw = mx.load(str(float_weight_path))
+                weights = sanitize_transformer_weights(float_raw)
+                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
+                weights = apply_lora_to_weights(weights, lora_specs, verbose=verbose)
 
-        transformer = LTXModel.from_pretrained(
-            model_path=transformer_weight_path,
-            config=config,
-            strict=True,
-            weights_override=weights_override,
-        )
+                # Create model, load float weights, then quantize using the same settings
+                transformer = LTXModel(config)
+                transformer.load_weights(list(weights.items()), strict=False)
+
+                # Read quantization settings from model_path (if available)
+                q_group_size = 64
+                q_bits = 4
+                q_mode = "affine"
+                q_scope = "core"
+                meta_path = model_path / "quantization.json"
+                if meta_path.exists():
+                    try:
+                        import json
+                        with open(meta_path, "r") as f:
+                            meta = json.load(f)
+                        q_group_size = int(meta.get("group_size", q_group_size))
+                        q_bits = int(meta.get("bits", q_bits))
+                        q_mode = meta.get("mode", q_mode)
+                        q_scope = meta.get("quantize_scope", meta.get("predicate", q_scope))
+                    except Exception:
+                        pass
+
+                if verbose:
+                    console.print(
+                        f"[dim]LoRA on quantized model: re-quantizing in-memory "
+                        f"(bits={q_bits}, group_size={q_group_size}, mode={q_mode}, scope={q_scope}).[/]"
+                    )
+
+                def _attn1_only_predicate(path, module):
+                    if not hasattr(module, "to_quantized"):
+                        return False
+                    if "transformer_blocks" not in path:
+                        return False
+                    if "audio_" in path or "audio_to_video" in path or "video_to_audio" in path:
+                        return False
+                    if ".attn1" not in path:
+                        return False
+                    return True
+
+                def _core_predicate(path, module):
+                    if not hasattr(module, "to_quantized"):
+                        return False
+                    if "transformer_blocks" not in path:
+                        return False
+                    if ".attn" in path or ".ff" in path:
+                        return True
+                    if "audio_attn" in path or "audio_ff" in path:
+                        return True
+                    if "audio_to_video_attn" in path or "video_to_audio_attn" in path:
+                        return True
+                    return False
+
+                def _all_quantizable_predicate(path, module):
+                    return hasattr(module, "to_quantized")
+
+                scope = q_scope
+                if scope == "all":
+                    pred = _all_quantizable_predicate
+                elif scope in ("core", "predicate", "scales"):
+                    pred = _core_predicate
+                else:
+                    pred = _attn1_only_predicate
+
+                nn.quantize(
+                    transformer,
+                    group_size=q_group_size,
+                    bits=q_bits,
+                    mode=q_mode,
+                    class_predicate=pred,
+                )
+            else:
+                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
+                weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
+
+        if transformer is None:
+            transformer = LTXModel.from_pretrained(
+                model_path=transformer_weight_path,
+                config=config,
+                strict=True,
+                weights_override=weights_override,
+            )
 
     console.print("[green]✓[/] Transformer loaded")
     _log_memory("transformer loaded", mem_log)
