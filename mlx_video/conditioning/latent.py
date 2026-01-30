@@ -5,7 +5,7 @@ the video generation process at specific frame positions.
 """
 
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
 import mlx.core as mx
 
@@ -29,6 +29,26 @@ class VideoConditionByLatentIndex:
     def get_num_latent_frames(self) -> int:
         """Get number of latent frames in the conditioning."""
         return self.latent.shape[2]
+
+
+@dataclass
+class VideoConditionByKeyframeIndex:
+    """Condition video generation by guiding with keyframe latents.
+
+    Unlike VideoConditionByLatentIndex (replace), this keeps the noisy latent
+    intact and only sets the clean reference + denoise mask to guide output.
+
+    Args:
+        keyframes: Encoded keyframes latent of shape (B, C, F, H, W)
+        frame_idx: Frame index to apply the keyframes
+        strength: Guidance strength (1.0 = strong guidance)
+    """
+    keyframes: mx.array
+    frame_idx: int = 0
+    strength: float = 1.0
+
+    def get_num_latent_frames(self) -> int:
+        return self.keyframes.shape[2]
 
 
 @dataclass
@@ -83,7 +103,7 @@ def create_initial_state(
 
 def apply_conditioning(
     state: LatentState,
-    conditionings: List[VideoConditionByLatentIndex],
+    conditionings: List[Union[VideoConditionByLatentIndex, VideoConditionByKeyframeIndex]],
 ) -> LatentState:
     """Apply conditioning items to a latent state.
 
@@ -99,9 +119,16 @@ def apply_conditioning(
     b, c, f, h, w = state.latent.shape
 
     for cond in conditionings:
-        cond_latent = cond.latent
-        frame_idx = cond.frame_idx
-        strength = cond.strength
+        if isinstance(cond, VideoConditionByKeyframeIndex):
+            cond_latent = cond.keyframes
+            frame_idx = cond.frame_idx
+            strength = cond.strength
+            mode = "guide"
+        else:
+            cond_latent = cond.latent
+            frame_idx = cond.frame_idx
+            strength = cond.strength
+            mode = "replace"
 
         # Validate shapes
         _, cond_c, cond_f, cond_h, cond_w = cond_latent.shape
@@ -120,7 +147,7 @@ def apply_conditioning(
         num_cond_frames = cond_f
         end_idx = min(frame_idx + num_cond_frames, f)
 
-        # Replace latent at conditioning position
+        # Replace or guide latent at conditioning position
         # state.latent[:, :, frame_idx:end_idx] = cond_latent[:, :, :end_idx - frame_idx]
         latent_list = []
         clean_list = []
@@ -130,7 +157,10 @@ def apply_conditioning(
             if frame_idx <= i < end_idx:
                 # Use conditioning latent
                 cond_idx = i - frame_idx
-                latent_list.append(cond_latent[:, :, cond_idx:cond_idx+1])
+                if mode == "replace":
+                    latent_list.append(cond_latent[:, :, cond_idx:cond_idx+1])
+                else:
+                    latent_list.append(state.latent[:, :, i:i+1])
                 clean_list.append(cond_latent[:, :, cond_idx:cond_idx+1])
                 # Set mask: 1.0 - strength means less denoising for conditioned frames
                 mask_list.append(mx.full((b, 1, 1, 1, 1), 1.0 - strength, dtype=dtype))

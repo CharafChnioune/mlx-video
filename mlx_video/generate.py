@@ -26,12 +26,19 @@ from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType, LTXRopeTyp
 from mlx_video.models.ltx.ltx import LTXModel
 from mlx_video.models.ltx.transformer import Modality
 
-from mlx_video.utils import to_denoised, load_image, prepare_image_for_encoding, get_model_path
+from mlx_video.utils import (
+    to_denoised,
+    load_image,
+    load_video,
+    prepare_image_for_encoding,
+    prepare_video_for_encoding,
+    get_model_path,
+)
 from mlx_video.models.ltx.video_vae.decoder import load_vae_decoder
 from mlx_video.models.ltx.video_vae.encoder import load_vae_encoder
 from mlx_video.models.ltx.video_vae.tiling import TilingConfig
 from mlx_video.models.ltx.upsampler import load_upsampler, upsample_latents
-from mlx_video.conditioning import VideoConditionByLatentIndex, apply_conditioning
+from mlx_video.conditioning import VideoConditionByLatentIndex, VideoConditionByKeyframeIndex, apply_conditioning
 from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
 
 
@@ -39,6 +46,8 @@ class PipelineType(Enum):
     """Pipeline type selector."""
     DISTILLED = "distilled"  # Two-stage with upsampling, fixed sigmas, no CFG
     DEV = "dev"              # Single-stage, dynamic sigmas, CFG
+    KEYFRAME = "keyframe"    # Two-stage, guiding keyframes (KFI)
+    IC_LORA = "ic_lora"      # Two-stage, IC-LoRA with video conditioning
 
 
 def _bytes_to_gb(value: float) -> float:
@@ -794,6 +803,10 @@ def generate_video(
     image: Optional[str] = None,
     image_strength: float = 1.0,
     image_frame_idx: int = 0,
+    images: Optional[list[tuple[str, int, float]]] = None,
+    video_conditionings: Optional[list[tuple[str, float]]] = None,
+    distilled_loras: Optional[list[tuple[str, float]]] = None,
+    conditioning_mode: str = "replace",
     tiling: str = "auto",
     stream: bool = False,
     audio: bool = False,
@@ -829,9 +842,13 @@ def generate_video(
         enhance_prompt: Whether to enhance prompt using Gemma
         max_tokens: Max tokens for prompt enhancement
         temperature: Temperature for prompt enhancement
-        image: Path to conditioning image for I2V
-        image_strength: Conditioning strength for I2V
-        image_frame_idx: Frame index to condition for I2V
+        image: Path to conditioning image for I2V (single)
+        image_strength: Conditioning strength for I2V (single)
+        image_frame_idx: Frame index to condition for I2V (single)
+        images: List of conditioning images (path, frame_idx, strength)
+        video_conditionings: List of video conditioning files (path, strength) for IC-LoRA
+        distilled_loras: LoRAs to apply for stage-2 refinement (distilled pipeline)
+        conditioning_mode: "replace" (default) or "guide" (keyframe-style)
         tiling: Tiling mode for VAE decoding
         stream: Stream frames to output as they're decoded
         audio: Enable synchronized audio generation
@@ -857,8 +874,28 @@ def generate_video(
             mx.metal.set_memory_limit(limit_bytes)
     _log_memory("start", mem_log)
 
+    # Normalize conditioning inputs
+    images_list = list(images or [])
+    if image is not None:
+        images_list.append((image, image_frame_idx, image_strength))
+    video_conditionings = list(video_conditionings or [])
+
+    # Handle extended pipeline types
+    if pipeline == PipelineType.KEYFRAME:
+        conditioning_mode = "guide"
+    if pipeline == PipelineType.IC_LORA:
+        if not video_conditionings:
+            raise ValueError("IC-LoRA pipeline requires --video-conditioning PATH STRENGTH")
+        conditioning_mode = "replace"
+
+    is_distilled_pipeline = pipeline in (PipelineType.DISTILLED, PipelineType.KEYFRAME, PipelineType.IC_LORA)
+    is_dev_pipeline = pipeline == PipelineType.DEV
+
+    if is_dev_pipeline and video_conditionings:
+        raise ValueError("Video conditioning is only supported in ic_lora/distilled pipelines.")
+
     # Validate dimensions
-    divisor = 64 if pipeline == PipelineType.DISTILLED else 32
+    divisor = 64 if is_distilled_pipeline else 32
     assert height % divisor == 0, f"Height must be divisible by {divisor}, got {height}"
     assert width % divisor == 0, f"Width must be divisible by {divisor}, got {width}"
 
@@ -869,21 +906,35 @@ def generate_video(
             console.print(f"[dim]Adjusted num_frames to {adjusted_num_frames} (1 + 8*k requirement).[/]")
         num_frames = adjusted_num_frames
 
-    is_i2v = image is not None
+    is_i2v = len(images_list) > 0
     mode_str = "I2V" if is_i2v else "T2V"
     if audio:
         mode_str += "+Audio"
 
-    pipeline_name = "DEV" if pipeline == PipelineType.DEV else "DISTILLED"
+    if pipeline == PipelineType.DEV:
+        pipeline_name = "DEV"
+    elif pipeline == PipelineType.KEYFRAME:
+        pipeline_name = "KEYFRAME"
+    elif pipeline == PipelineType.IC_LORA:
+        pipeline_name = "IC_LORA"
+    else:
+        pipeline_name = "DISTILLED"
     header = f"[bold cyan]🎬 [{pipeline_name}] [{mode_str}] {width}x{height} • {num_frames} frames[/]"
     console.print(Panel(header, expand=False))
     console.print(f"[dim]Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}[/]")
 
-    if pipeline == PipelineType.DEV:
+    if is_dev_pipeline:
         console.print(f"[dim]Steps: {num_inference_steps}, CFG: {cfg_scale}[/]")
 
     if is_i2v:
-        console.print(f"[dim]Image: {image} (strength={image_strength}, frame={image_frame_idx})[/]")
+        for img_path, frame_idx, strength in images_list:
+            console.print(f"[dim]Image: {img_path} (strength={strength}, frame={frame_idx})[/]")
+        if conditioning_mode == "guide":
+            console.print("[dim]Image conditioning mode: guide (keyframe)[/]")
+
+    if video_conditionings:
+        for vpath, vstrength in video_conditionings:
+            console.print(f"[dim]Video conditioning: {vpath} (strength={vstrength})[/]")
 
     if loras:
         console.print(f"[dim]LoRAs: {len(loras)}[/]")
@@ -900,12 +951,12 @@ def generate_video(
     text_encoder_path = model_path if text_encoder_repo is None else get_model_path(text_encoder_repo)
 
     # Model weight file (base PyTorch weights) and optional MLX-converted transformer
-    weight_file = "ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors"
-    mlx_weight_file = model_path / f"ltx-2-19b-{'dev' if pipeline == PipelineType.DEV else 'distilled'}-mlx.safetensors"
+    weight_file = "ltx-2-19b-dev.safetensors" if is_dev_pipeline else "ltx-2-19b-distilled.safetensors"
+    mlx_weight_file = model_path / f"ltx-2-19b-{'dev' if is_dev_pipeline else 'distilled'}-mlx.safetensors"
     transformer_weight_path = mlx_weight_file if mlx_weight_file.exists() else model_path / weight_file
 
     # Calculate latent dimensions
-    if pipeline == PipelineType.DISTILLED:
+    if is_distilled_pipeline:
         stage1_h, stage1_w = height // 2 // 32, width // 2 // 32
         stage2_h, stage2_w = height // 32, width // 32
     else:
@@ -929,7 +980,7 @@ def generate_video(
         console.print(f"[dim]Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}[/]")
 
     # Encode prompts
-    if pipeline == PipelineType.DEV:
+    if is_dev_pipeline:
         # Dev pipeline needs positive and negative embeddings
         if audio:
             video_embeddings_pos, audio_embeddings_pos = text_encoder(prompt, return_audio_embeddings=True)
@@ -957,45 +1008,41 @@ def generate_video(
     mx.clear_cache()
     _log_memory("text encoder freed", mem_log)
 
-    # Load transformer
+    # Load transformer (stage-1)
     transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
-    with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
-        
 
-        model_type = LTXModelType.AudioVideo if audio else LTXModelType.VideoOnly
-
-        config_kwargs = dict(
-            model_type=model_type,
-            num_attention_heads=32,
-            attention_head_dim=128,
-            in_channels=128,
-            out_channels=128,
-            num_layers=48,
-            cross_attention_dim=4096,
-            caption_channels=3840,
-            rope_type=LTXRopeType.SPLIT,
-            double_precision_rope=True,
-            positional_embedding_theta=10000.0,
-            positional_embedding_max_pos=[20, 2048, 2048],
-            use_middle_indices_grid=True,
-            timestep_scale_multiplier=1000,
+    model_type = LTXModelType.AudioVideo if audio else LTXModelType.VideoOnly
+    config_kwargs = dict(
+        model_type=model_type,
+        num_attention_heads=32,
+        attention_head_dim=128,
+        in_channels=128,
+        out_channels=128,
+        num_layers=48,
+        cross_attention_dim=4096,
+        caption_channels=3840,
+        rope_type=LTXRopeType.SPLIT,
+        double_precision_rope=True,
+        positional_embedding_theta=10000.0,
+        positional_embedding_max_pos=[20, 2048, 2048],
+        use_middle_indices_grid=True,
+        timestep_scale_multiplier=1000,
+    )
+    if audio:
+        config_kwargs.update(
+            audio_num_attention_heads=32,
+            audio_attention_head_dim=64,
+            audio_in_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
+            audio_out_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
+            audio_cross_attention_dim=2048,
+            audio_positional_embedding_max_pos=[20],
         )
+    config = LTXModelConfig(**config_kwargs)
 
-        if audio:
-            config_kwargs.update(
-                audio_num_attention_heads=32,
-                audio_attention_head_dim=64,
-                audio_in_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
-                audio_out_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
-                audio_cross_attention_dim=2048,
-                audio_positional_embedding_max_pos=[20],
-            )
-
-        config = LTXModelConfig(**config_kwargs)
-
-        transformer = None
+    def _load_transformer_with_loras(lora_list: Optional[list[tuple[str, float]]]):
+        transformer_local = None
         weights_override = None
-        if loras:
+        if lora_list:
             from mlx_video.lora import LoraSpec, apply_lora_to_weights, has_quantized_weights
             raw_weights = mx.load(str(transformer_weight_path))
             if has_quantized_weights(raw_weights):
@@ -1008,12 +1055,11 @@ def generate_video(
                 from mlx_video.convert import sanitize_transformer_weights
                 float_raw = mx.load(str(float_weight_path))
                 weights = sanitize_transformer_weights(float_raw)
-                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
+                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
                 weights = apply_lora_to_weights(weights, lora_specs, verbose=verbose)
 
-                # Create model, load float weights, then quantize using the same settings
-                transformer = LTXModel(config)
-                transformer.load_weights(list(weights.items()), strict=False)
+                transformer_local = LTXModel(config)
+                transformer_local.load_weights(list(weights.items()), strict=False)
 
                 # Read quantization settings from model_path (if available)
                 q_group_size = 64
@@ -1075,23 +1121,27 @@ def generate_video(
                     pred = _attn1_only_predicate
 
                 nn.quantize(
-                    transformer,
+                    transformer_local,
                     group_size=q_group_size,
                     bits=q_bits,
                     mode=q_mode,
                     class_predicate=pred,
                 )
             else:
-                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
+                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
                 weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
 
-        if transformer is None:
-            transformer = LTXModel.from_pretrained(
+        if transformer_local is None:
+            transformer_local = LTXModel.from_pretrained(
                 model_path=transformer_weight_path,
                 config=config,
-                strict=True,
+                strict=False,
                 weights_override=weights_override,
             )
+        return transformer_local
+
+    with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
+        transformer = _load_transformer_with_loras(loras)
 
     console.print("[green]✓[/] Transformer loaded")
     _log_memory("transformer loaded", mem_log)
@@ -1100,28 +1150,56 @@ def generate_video(
     # Pipeline-specific generation logic
     # ==========================================================================
 
-    if pipeline == PipelineType.DISTILLED:
+    if is_distilled_pipeline:
         # ======================================================================
         # DISTILLED PIPELINE: Two-stage with upsampling
         # ======================================================================
 
-        # Load VAE encoder for I2V
-        stage1_image_latent = None
-        stage2_image_latent = None
-        if is_i2v:
+        # Load VAE encoder for conditioning (images/video)
+        stage1_conditionings = []
+        stage2_conditionings = []
+        stage1_video_conditionings = []
+
+        if is_i2v or video_conditionings:
             with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
                 vae_encoder = load_vae_encoder(str(model_path / weight_file))
                 mx.eval(vae_encoder.parameters())
 
-                input_image = load_image(image, height=height // 2, width=width // 2, dtype=model_dtype)
-                stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2, dtype=model_dtype)
-                stage1_image_latent = vae_encoder(stage1_image_tensor)
-                mx.eval(stage1_image_latent)
+                for img_path, frame_idx, strength in images_list:
+                    input_image = load_image(img_path, height=height // 2, width=width // 2, dtype=model_dtype)
+                    stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2, dtype=model_dtype)
+                    stage1_latent = vae_encoder(stage1_image_tensor)
+                    mx.eval(stage1_latent)
 
-                input_image = load_image(image, height=height, width=width, dtype=model_dtype)
-                stage2_image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
-                stage2_image_latent = vae_encoder(stage2_image_tensor)
-                mx.eval(stage2_image_latent)
+                    input_image = load_image(img_path, height=height, width=width, dtype=model_dtype)
+                    stage2_image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
+                    stage2_latent = vae_encoder(stage2_image_tensor)
+                    mx.eval(stage2_latent)
+
+                    if conditioning_mode == "guide":
+                        stage1_conditionings.append(
+                            VideoConditionByKeyframeIndex(keyframes=stage1_latent, frame_idx=frame_idx, strength=strength)
+                        )
+                        stage2_conditionings.append(
+                            VideoConditionByKeyframeIndex(keyframes=stage2_latent, frame_idx=frame_idx, strength=strength)
+                        )
+                    else:
+                        stage1_conditionings.append(
+                            VideoConditionByLatentIndex(latent=stage1_latent, frame_idx=frame_idx, strength=strength)
+                        )
+                        stage2_conditionings.append(
+                            VideoConditionByLatentIndex(latent=stage2_latent, frame_idx=frame_idx, strength=strength)
+                        )
+
+                # Video conditioning (IC-LoRA)
+                for vid_path, strength in video_conditionings:
+                    frames = load_video(vid_path, height=height // 2, width=width // 2, frame_cap=num_frames, dtype=model_dtype)
+                    video_tensor = prepare_video_for_encoding(frames, height // 2, width // 2, dtype=model_dtype)
+                    video_latent = vae_encoder(video_tensor)
+                    mx.eval(video_latent)
+                    stage1_video_conditionings.append(
+                        VideoConditionByKeyframeIndex(keyframes=video_latent, frame_idx=0, strength=strength)
+                    )
 
                 del vae_encoder
                 mx.clear_cache()
@@ -1141,17 +1219,16 @@ def generate_video(
             audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)).astype(model_dtype)
             mx.eval(audio_positions, audio_latents)
 
-        # Apply I2V conditioning
+        # Apply conditioning (images + optional video)
         state1 = None
-        if is_i2v and stage1_image_latent is not None:
+        if stage1_conditionings or stage1_video_conditionings:
             latent_shape = (1, 128, latent_frames, stage1_h, stage1_w)
             state1 = LatentState(
                 latent=mx.zeros(latent_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(latent_shape, dtype=model_dtype),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
-            conditioning = VideoConditionByLatentIndex(latent=stage1_image_latent, frame_idx=image_frame_idx, strength=image_strength)
-            state1 = apply_conditioning(state1, [conditioning])
+            state1 = apply_conditioning(state1, stage1_conditionings + stage1_video_conditionings)
 
             noise = mx.random.normal(latent_shape, dtype=model_dtype)
             noise_scale = mx.array(STAGE_1_SIGMAS[0], dtype=model_dtype)
@@ -1193,15 +1270,23 @@ def generate_video(
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
 
+        if distilled_loras:
+            del transformer
+            mx.clear_cache()
+            _log_memory("before stage2 transformer load", mem_log)
+            with console.status("[blue]🤖 Loading stage-2 transformer (distilled LoRA)...[/]", spinner="dots"):
+                transformer = _load_transformer_with_loras(distilled_loras)
+            console.print("[green]✓[/] Stage-2 transformer loaded")
+
         state2 = None
-        if is_i2v and stage2_image_latent is not None:
+        if stage2_conditionings:
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
-            conditioning = VideoConditionByLatentIndex(latent=stage2_image_latent, frame_idx=image_frame_idx, strength=image_strength)
-            state2 = apply_conditioning(state2, [conditioning])
+            # For IC-LoRA, stage2 uses replace for images (as in PyTorch)
+            state2 = apply_conditioning(state2, stage2_conditionings)
 
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
@@ -1244,16 +1329,26 @@ def generate_video(
         # ======================================================================
 
         # Load VAE encoder for I2V
-        image_latent = None
+        dev_conditionings = []
         if is_i2v:
             with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
                 vae_encoder = load_vae_encoder(str(model_path / weight_file))
                 mx.eval(vae_encoder.parameters())
 
-                input_image = load_image(image, height=height, width=width, dtype=model_dtype)
-                image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
-                image_latent = vae_encoder(image_tensor)
-                mx.eval(image_latent)
+                for img_path, frame_idx, strength in images_list:
+                    input_image = load_image(img_path, height=height, width=width, dtype=model_dtype)
+                    image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
+                    image_latent = vae_encoder(image_tensor)
+                    mx.eval(image_latent)
+
+                    if conditioning_mode == "guide":
+                        dev_conditionings.append(
+                            VideoConditionByKeyframeIndex(keyframes=image_latent, frame_idx=frame_idx, strength=strength)
+                        )
+                    else:
+                        dev_conditionings.append(
+                            VideoConditionByLatentIndex(latent=image_latent, frame_idx=frame_idx, strength=strength)
+                        )
 
                 del vae_encoder
                 mx.clear_cache()
@@ -1281,14 +1376,13 @@ def generate_video(
         # Initialize latents with optional I2V conditioning
         video_state = None
         video_latent_shape = (1, 128, latent_frames, latent_h, latent_w)
-        if is_i2v and image_latent is not None:
+        if dev_conditionings:
             video_state = LatentState(
                 latent=mx.zeros(video_latent_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(video_latent_shape, dtype=model_dtype),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
-            conditioning = VideoConditionByLatentIndex(latent=image_latent, frame_idx=image_frame_idx, strength=image_strength)
-            video_state = apply_conditioning(video_state, [conditioning])
+            video_state = apply_conditioning(video_state, dev_conditionings)
 
             noise = mx.random.normal(video_latent_shape, dtype=model_dtype)
             noise_scale = sigmas[0]
@@ -1500,6 +1594,32 @@ def generate_video(
 
 
 def main():
+    class ImageConditionAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            if len(values) not in (1, 3):
+                msg = f"{option_string} accepts 1 or 3 args (PATH [FRAME_IDX STRENGTH]), got {len(values)}"
+                raise argparse.ArgumentError(self, msg)
+            path = values[0]
+            if len(values) == 3:
+                frame_idx = int(values[1])
+                strength = float(values[2])
+            else:
+                frame_idx = None
+                strength = None
+            current = getattr(namespace, self.dest) or []
+            current.append((path, frame_idx, strength))
+            setattr(namespace, self.dest, current)
+
+    class VideoConditionAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            if len(values) != 2:
+                msg = f"{option_string} accepts PATH and STRENGTH"
+                raise argparse.ArgumentError(self, msg)
+            path, strength = values[0], float(values[1])
+            current = getattr(namespace, self.dest) or []
+            current.append((path, strength))
+            setattr(namespace, self.dest, current)
+
     parser = argparse.ArgumentParser(
         description="Generate videos with MLX LTX-2 (Distilled or Dev pipeline)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1524,8 +1644,13 @@ Examples:
     )
 
     parser.add_argument("--prompt", "-p", type=str, required=True, help="Text description of the video to generate")
-    parser.add_argument("--pipeline", type=str, default="distilled", choices=["distilled", "dev"],
-                        help="Pipeline type: distilled (two-stage, fast) or dev (single-stage, CFG)")
+    parser.add_argument(
+        "--pipeline",
+        type=str,
+        default="distilled",
+        choices=["distilled", "dev", "keyframe", "ic_lora"],
+        help="Pipeline type: distilled (two-stage), dev (single-stage CFG), keyframe (two-stage keyframe), ic_lora (two-stage with video conditioning)",
+    )
     parser.add_argument("--negative-prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
                         help="Negative prompt for CFG (dev pipeline only)")
     parser.add_argument("--height", "-H", type=int, default=512, help="Output video height")
@@ -1550,9 +1675,39 @@ Examples:
     parser.add_argument("--enhance-prompt", action="store_true", help="Enhance the prompt using Gemma")
     parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens for prompt enhancement")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for prompt enhancement")
-    parser.add_argument("--image", "-i", type=str, default=None, help="Path to conditioning image for I2V")
+    parser.add_argument(
+        "--image",
+        "-i",
+        action=ImageConditionAction,
+        nargs="+",
+        metavar="PATH",
+        default=[],
+        help="Image conditioning. Use once: --image path.jpg or multi: --image path.jpg 0 0.8 (can be repeated).",
+    )
     parser.add_argument("--image-strength", type=float, default=1.0, help="Conditioning strength for I2V")
     parser.add_argument("--image-frame-idx", type=int, default=0, help="Frame index to condition for I2V")
+    parser.add_argument(
+        "--video-conditioning",
+        action=VideoConditionAction,
+        nargs=2,
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help="Video conditioning for IC-LoRA (can be repeated)",
+    )
+    parser.add_argument(
+        "--distilled-lora",
+        action="append",
+        nargs=2,
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help="LoRA(s) for stage-2 refinement (distilled pipeline only)",
+    )
+    parser.add_argument(
+        "--conditioning-mode",
+        choices=["replace", "guide"],
+        default="replace",
+        help="Image conditioning mode: replace (default) or guide (keyframe-style).",
+    )
     parser.add_argument("--tiling", type=str, default="auto",
                         choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
                         help="Tiling mode for VAE decoding")
@@ -1565,7 +1720,20 @@ Examples:
     parser.add_argument("--memory-limit-gb", type=float, default=None, help="Set MLX memory limit in GB")
     args = parser.parse_args()
 
-    pipeline = PipelineType.DEV if args.pipeline == "dev" else PipelineType.DISTILLED
+    pipeline = {
+        "dev": PipelineType.DEV,
+        "distilled": PipelineType.DISTILLED,
+        "keyframe": PipelineType.KEYFRAME,
+        "ic_lora": PipelineType.IC_LORA,
+    }[args.pipeline]
+
+    images = []
+    for path, frame_idx, strength in args.image:
+        if frame_idx is None:
+            frame_idx = args.image_frame_idx
+        if strength is None:
+            strength = args.image_strength
+        images.append((path, frame_idx, strength))
 
     generate_video(
         model_repo=args.model_repo,
@@ -1586,9 +1754,13 @@ Examples:
         enhance_prompt=args.enhance_prompt,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
-        image=args.image,
+        image=None,
+        images=images,
         image_strength=args.image_strength,
         image_frame_idx=args.image_frame_idx,
+        video_conditionings=args.video_conditioning,
+        distilled_loras=[(p, float(s)) for p, s in args.distilled_lora],
+        conditioning_mode=args.conditioning_mode,
         tiling=args.tiling,
         stream=args.stream,
         audio=args.audio,

@@ -8,6 +8,7 @@ from functools import partial
 from pathlib import Path
 from huggingface_hub import snapshot_download
 from PIL import Image
+import cv2
 
 def get_model_path(model_repo: str):
     """Get or download model path.
@@ -234,6 +235,42 @@ def load_image(
     return mx.array(image_np, dtype=dtype)
 
 
+def load_video(
+    video_path: Union[str, Path],
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+    frame_cap: Optional[int] = None,
+    dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """Load a video for conditioning.
+
+    Returns frames as (F, H, W, 3) in [0,1].
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Unable to open video: {video_path}")
+
+    frames = []
+    count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if height is not None and width is not None:
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        frames.append(frame.astype(np.float32) / 255.0)
+        count += 1
+        if frame_cap is not None and count >= frame_cap:
+            break
+    cap.release()
+
+    if not frames:
+        raise ValueError(f"No frames decoded from video: {video_path}")
+
+    return mx.array(np.stack(frames, axis=0), dtype=dtype)
+
+
 def resize_image_aspect_ratio(
     image: mx.array,
     long_side: int = 512,
@@ -306,3 +343,35 @@ def prepare_image_for_encoding(
     image = mx.expand_dims(image, axis=2)  # (1, 3, 1, H, W)
 
     return image.astype(dtype)
+
+
+def prepare_video_for_encoding(
+    frames: mx.array,
+    target_height: int,
+    target_width: int,
+    dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """Prepare video frames for VAE encoding.
+
+    Args:
+        frames: Video frames (F, H, W, 3) in [0,1]
+    Returns:
+        Tensor (1, 3, F, H, W) in [-1,1]
+    """
+    if frames.ndim != 4:
+        raise ValueError(f"Expected frames (F,H,W,3), got {frames.shape}")
+
+    np_frames = np.array(frames.astype(mx.float32))
+    if np_frames.shape[1] != target_height or np_frames.shape[2] != target_width:
+        resized = []
+        for f in np_frames:
+            resized.append(cv2.resize(f, (target_width, target_height), interpolation=cv2.INTER_AREA))
+        np_frames = np.stack(resized, axis=0)
+
+    # Normalize to [-1,1]
+    np_frames = np_frames * 2.0 - 1.0
+
+    # (F,H,W,3) -> (1,3,F,H,W)
+    np_frames = np.transpose(np_frames, (3, 0, 1, 2))
+    np_frames = np.expand_dims(np_frames, axis=0)
+    return mx.array(np_frames, dtype=dtype)
