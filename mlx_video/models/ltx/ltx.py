@@ -571,10 +571,28 @@ class LTXModel(nn.Module):
                     return False
                 return True
 
+            def _core_predicate(p, m):
+                if not hasattr(m, "to_quantized"):
+                    return False
+                if "transformer_blocks" not in p:
+                    return False
+                if ".attn" in p or ".ff" in p:
+                    return True
+                if "audio_attn" in p or "audio_ff" in p:
+                    return True
+                if "audio_to_video_attn" in p or "video_to_audio_attn" in p:
+                    return True
+                return False
+
             def _scales_predicate(p, m):
                 return f"{p}.scales" in sanitized
 
-            pred = _attn1_only_predicate if predicate == "attn1_only" else _scales_predicate
+            if predicate == "attn1_only":
+                pred = _attn1_only_predicate
+            elif predicate == "core":
+                pred = _core_predicate
+            else:
+                pred = _scales_predicate
 
             nn.quantize(
                 model,

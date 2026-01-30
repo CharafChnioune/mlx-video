@@ -532,6 +532,8 @@ def convert(
     q_bits: int = 4,
     q_group_size: int = 64,
     q_mode: str = "affine",
+    quantize_scope: str = "attn1",
+    report_layers: bool = False,
     pipeline: str = "dev",
 ) -> Path:
     """Convert HuggingFace model to MLX format.
@@ -543,6 +545,8 @@ def convert(
         quantize: Whether to quantize the model
         q_bits: Quantization bits
         q_group_size: Quantization group size
+        quantize_scope: Quantization scope ("attn1" or "all")
+        report_layers: Whether to write a layer report JSON
 
     Returns:
         Path to converted model
@@ -597,12 +601,32 @@ def convert(
                 return False
             return True
 
+        def _core_predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            if "transformer_blocks" not in path:
+                return False
+            if ".attn" in path or ".ff" in path:
+                return True
+            if "audio_attn" in path or "audio_ff" in path:
+                return True
+            if "audio_to_video_attn" in path or "video_to_audio_attn" in path:
+                return True
+            return False
+
+        def _all_quantizable_predicate(path, module):
+            return hasattr(module, "to_quantized")
+
         nn.quantize(
             model,
             group_size=q_group_size,
             bits=q_bits,
             mode=q_mode,
-            class_predicate=_attn1_only_predicate,
+            class_predicate=(
+                _all_quantizable_predicate
+                if quantize_scope == "all"
+                else (_core_predicate if quantize_scope == "core" else _attn1_only_predicate)
+            ),
         )
         from mlx.utils import tree_flatten
         weights = tree_flatten(model.parameters(), destination={})
@@ -628,10 +652,43 @@ def convert(
             "mode": q_mode,
             "dtype": dtype or "float16",
             "pipeline": pipeline,
-            "predicate": "attn1_only",
+            "predicate": "scales" if quantize_scope == "all" else ("core" if quantize_scope == "core" else "attn1_only"),
+            "quantize_scope": quantize_scope,
         }
         with open(output_path / "quantization.json", "w") as f:
             json.dump(meta, f, indent=2)
+
+    if report_layers:
+        report = {
+            "pipeline": pipeline,
+            "quantize": quantize,
+            "quantize_scope": quantize_scope,
+            "dtype": dtype or "float16",
+            "layers": [],
+        }
+        dtype_totals = {}
+        total_bytes = 0
+        for name, tensor in weights.items():
+            nbytes = int(tensor.nbytes)
+            total_bytes += nbytes
+            dtype_key = str(tensor.dtype)
+            dtype_totals[dtype_key] = dtype_totals.get(dtype_key, 0) + nbytes
+            report["layers"].append(
+                {
+                    "name": name,
+                    "shape": list(tensor.shape),
+                    "dtype": dtype_key,
+                    "nbytes": nbytes,
+                }
+            )
+        report["totals"] = {
+            "bytes": total_bytes,
+            "by_dtype": dtype_totals,
+        }
+        report_path = output_path / "layer_report.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"Wrote layer report to {report_path}")
 
     print(f"Model converted successfully to {output_path}")
     return output_path
@@ -737,6 +794,18 @@ if __name__ == "__main__":
         help="Quantization mode",
     )
     parser.add_argument(
+        "--quantize-scope",
+        type=str,
+        choices=["attn1", "core", "all"],
+        default="attn1",
+        help="Quantization scope: attn1, core (attn+ff), or all quantizable layers",
+    )
+    parser.add_argument(
+        "--report-layers",
+        action="store_true",
+        help="Write layer_report.json with per-layer dtype/size",
+    )
+    parser.add_argument(
         "--pipeline",
         type=str,
         choices=["dev", "distilled"],
@@ -754,5 +823,7 @@ if __name__ == "__main__":
         q_bits=args.q_bits,
         q_group_size=args.q_group_size,
         q_mode=args.q_mode,
+        quantize_scope=args.quantize_scope,
+        report_layers=args.report_layers,
         pipeline=args.pipeline,
     )

@@ -8,7 +8,7 @@ import math
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -38,6 +38,37 @@ class PipelineType(Enum):
     """Pipeline type selector."""
     DISTILLED = "distilled"  # Two-stage with upsampling, fixed sigmas, no CFG
     DEV = "dev"              # Single-stage, dynamic sigmas, CFG
+
+
+def _bytes_to_gb(value: float) -> float:
+    return value / (1024 ** 3)
+
+
+def _get_memory_stats() -> Tuple[float, float, float]:
+    active = mx.get_active_memory()
+    peak = mx.get_peak_memory()
+    cache = 0.0
+    if hasattr(mx, "get_cache_memory"):
+        try:
+            cache = mx.get_cache_memory()
+        except Exception:
+            cache = 0.0
+    elif hasattr(mx, "metal"):
+        try:
+            cache = mx.metal.get_cache_memory()
+        except Exception:
+            cache = 0.0
+    return active, cache, peak
+
+
+def _log_memory(stage: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    active, cache, peak = _get_memory_stats()
+    console.print(
+        f"[dim]Memory ({stage}): active={_bytes_to_gb(active):.2f}GB, "
+        f"cache={_bytes_to_gb(cache):.2f}GB, peak={_bytes_to_gb(peak):.2f}GB[/]"
+    )
 
 
 # Distilled model sigma schedules
@@ -764,6 +795,10 @@ def generate_video(
     stream: bool = False,
     audio: bool = False,
     output_audio_path: Optional[str] = None,
+    mem_log: bool = False,
+    clear_cache: bool = False,
+    cache_limit_gb: Optional[float] = None,
+    memory_limit_gb: Optional[float] = None,
 ):
     """Generate video using LTX-2 models.
 
@@ -797,8 +832,25 @@ def generate_video(
         stream: Stream frames to output as they're decoded
         audio: Enable synchronized audio generation
         output_audio_path: Path to save audio file
+        mem_log: Log active/cache/peak memory at key stages
+        clear_cache: Clear MLX cache after generation
+        cache_limit_gb: Set MLX cache limit in GB
+        memory_limit_gb: Set MLX memory limit in GB
     """
     start_time = time.time()
+    if cache_limit_gb is not None:
+        limit_bytes = int(cache_limit_gb * (1024 ** 3))
+        if hasattr(mx, "set_cache_limit"):
+            mx.set_cache_limit(limit_bytes)
+        elif hasattr(mx, "metal"):
+            mx.metal.set_cache_limit(limit_bytes)
+    if memory_limit_gb is not None:
+        limit_bytes = int(memory_limit_gb * (1024 ** 3))
+        if hasattr(mx, "set_memory_limit"):
+            mx.set_memory_limit(limit_bytes)
+        elif hasattr(mx, "metal"):
+            mx.metal.set_memory_limit(limit_bytes)
+    _log_memory("start", mem_log)
 
     # Validate dimensions
     divisor = 64 if pipeline == PipelineType.DISTILLED else 32
@@ -891,6 +943,7 @@ def generate_video(
 
     del text_encoder
     mx.clear_cache()
+    _log_memory("text encoder freed", mem_log)
 
     # Load transformer
     transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
@@ -931,6 +984,7 @@ def generate_video(
         transformer = LTXModel.from_pretrained(model_path=transformer_weight_path, config=config, strict=True)
 
     console.print("[green]✓[/] Transformer loaded")
+    _log_memory("transformer loaded", mem_log)
 
     # ==========================================================================
     # Pipeline-specific generation logic
@@ -1008,6 +1062,7 @@ def generate_video(
             verbose=verbose, state=state1,
             audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
         )
+        _log_memory("stage1 complete", mem_log)
 
         # Upsample latents
         with console.status("[magenta]🔍 Upsampling latents 2x...[/]", spinner="dots"):
@@ -1071,6 +1126,7 @@ def generate_video(
             verbose=verbose, state=state2,
             audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
         )
+        _log_memory("stage2 complete", mem_log)
 
     else:
         # ======================================================================
@@ -1152,12 +1208,14 @@ def generate_video(
                 latents, video_positions, video_embeddings_pos, video_embeddings_neg,
                 transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, state=video_state
             )
+        _log_memory("denoise complete", mem_log)
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
         vae_decoder = load_vae_decoder(str(model_path / weight_file), timestep_conditioning=None)
 
     del transformer
     mx.clear_cache()
+    _log_memory("after transformer free", mem_log)
 
     # ==========================================================================
     # Decode and save outputs (common to both pipelines)
@@ -1304,6 +1362,7 @@ def generate_video(
 
     del vae_decoder
     mx.clear_cache()
+    _log_memory("after decode", mem_log)
 
     if save_frames:
         frames_dir = output_path.parent / f"{output_path.stem}_frames"
@@ -1320,6 +1379,10 @@ def generate_video(
         f"[bold green]✨ Peak memory:[/] {mx.get_peak_memory() / (1024 ** 3):.2f}GB",
         expand=False
     ))
+
+    if clear_cache:
+        mx.clear_cache()
+        _log_memory("after clear-cache", mem_log)
 
     if audio:
         return video_np, audio_np
@@ -1379,6 +1442,10 @@ Examples:
     parser.add_argument("--stream", action="store_true", help="Stream frames to output as they're decoded")
     parser.add_argument("--audio", "-a", action="store_true", help="Enable synchronized audio generation")
     parser.add_argument("--output-audio", type=str, default=None, help="Output audio path")
+    parser.add_argument("--mem-log", action="store_true", help="Log active/cache/peak memory at key stages")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear MLX cache after generation")
+    parser.add_argument("--cache-limit-gb", type=float, default=None, help="Set MLX cache limit in GB")
+    parser.add_argument("--memory-limit-gb", type=float, default=None, help="Set MLX memory limit in GB")
     args = parser.parse_args()
 
     pipeline = PipelineType.DEV if args.pipeline == "dev" else PipelineType.DISTILLED
@@ -1409,6 +1476,10 @@ Examples:
         stream=args.stream,
         audio=args.audio,
         output_audio_path=args.output_audio,
+        mem_log=args.mem_log,
+        clear_cache=args.clear_cache,
+        cache_limit_gb=args.cache_limit_gb,
+        memory_limit_gb=args.memory_limit_gb,
     )
 
 
