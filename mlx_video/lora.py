@@ -45,11 +45,14 @@ def _lora_base_key(lora_key: str) -> str | None:
 
 
 def load_lora_state(path: Path) -> Dict[str, mx.array]:
-    weights: Dict[str, mx.array] = {}
-    with safe_open(str(path), framework="numpy") as f:
-        for key in f.keys():
-            weights[key] = mx.array(f.get_tensor(key))
-    return weights
+    try:
+        return dict(mx.load(str(path)))
+    except Exception:
+        weights: Dict[str, mx.array] = {}
+        with safe_open(str(path), framework="numpy") as f:
+            for key in f.keys():
+                weights[key] = mx.array(f.get_tensor(key))
+        return weights
 
 
 def _iter_lora_pairs(lora_sd: Dict[str, mx.array]) -> Iterable[Tuple[str, mx.array, mx.array]]:
