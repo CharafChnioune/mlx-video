@@ -799,6 +799,7 @@ def generate_video(
     clear_cache: bool = False,
     cache_limit_gb: Optional[float] = None,
     memory_limit_gb: Optional[float] = None,
+    loras: Optional[list[tuple[str, float]]] = None,
 ):
     """Generate video using LTX-2 models.
 
@@ -836,6 +837,7 @@ def generate_video(
         clear_cache: Clear MLX cache after generation
         cache_limit_gb: Set MLX cache limit in GB
         memory_limit_gb: Set MLX memory limit in GB
+        loras: Optional list of (path, strength) LoRA weights to merge
     """
     start_time = time.time()
     if cache_limit_gb is not None:
@@ -877,6 +879,11 @@ def generate_video(
 
     if is_i2v:
         console.print(f"[dim]Image: {image} (strength={image_strength}, frame={image_frame_idx})[/]")
+
+    if loras:
+        console.print(f"[dim]LoRAs: {len(loras)}[/]")
+        for lora_path, strength in loras:
+            console.print(f"[dim]  - {lora_path} (strength={strength})[/]")
 
     audio_frames = None
     if audio:
@@ -981,7 +988,21 @@ def generate_video(
 
         config = LTXModelConfig(**config_kwargs)
 
-        transformer = LTXModel.from_pretrained(model_path=transformer_weight_path, config=config, strict=True)
+        weights_override = None
+        if loras:
+            from mlx_video.lora import LoraSpec, apply_lora_to_weights, has_quantized_weights
+            raw_weights = mx.load(str(transformer_weight_path))
+            if has_quantized_weights(raw_weights):
+                raise ValueError("LoRA merging is not supported on quantized weights. Bake LoRA during conversion.")
+            lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
+            weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
+
+        transformer = LTXModel.from_pretrained(
+            model_path=transformer_weight_path,
+            config=config,
+            strict=True,
+            weights_override=weights_override,
+        )
 
     console.print("[green]✓[/] Transformer loaded")
     _log_memory("transformer loaded", mem_log)
@@ -1430,6 +1451,13 @@ Examples:
     parser.add_argument("--model-repo", type=str, default="Lightricks/LTX-2", help="Model repository")
     parser.add_argument("--text-encoder-repo", type=str, default=None, help="Text encoder repository")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--lora",
+        nargs=2,
+        action="append",
+        metavar=("PATH", "STRENGTH"),
+        help="LoRA weights to merge (can be used multiple times): --lora path 0.8",
+    )
     parser.add_argument("--enhance-prompt", action="store_true", help="Enhance the prompt using Gemma")
     parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens for prompt enhancement")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for prompt enhancement")
@@ -1480,6 +1508,7 @@ Examples:
         clear_cache=args.clear_cache,
         cache_limit_gb=args.cache_limit_gb,
         memory_limit_gb=args.memory_limit_gb,
+        loras=args.lora,
     )
 
 

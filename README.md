@@ -27,6 +27,7 @@ Supported models:
 - Two-stage generation pipeline for high-quality output
 - 2x spatial upscaling for images and videos
 - Optimized for Apple Silicon using MLX
+- LoRA merge support for inference (bf16) and LoRA-baked quant conversion
 
 
 ## Usage
@@ -66,6 +67,22 @@ python -m mlx_video.generate \
 | `--output`, `-o` | output.mp4 | Output video path |
 | `--save-frames` | false | Save individual frames as images |
 | `--model-repo` | Lightricks/LTX-2 | HuggingFace model repository |
+| `--lora` | (none) | Merge LoRA weights (repeatable: `--lora path strength`) |
+
+### Trainer (PyTorch/CUDA)
+
+The full LTX-2 trainer stack (ltx_core, ltx_pipelines, ltx_trainer) is included for parity with the original PyTorch repo.
+It requires the optional `trainer` dependencies and a CUDA-capable Linux environment.
+
+Install trainer deps:
+```bash
+uv pip install -e .[trainer]
+```
+
+Run training:
+```bash
+ltx_trainer.train ltx_trainer/configs/ltx2_av_lora.yaml
+```
 
 ## How It Works
 

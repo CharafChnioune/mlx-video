@@ -535,6 +535,7 @@ def convert(
     quantize_scope: str = "attn1",
     report_layers: bool = False,
     pipeline: str = "dev",
+    loras: Optional[list[tuple[str, float]]] = None,
 ) -> Path:
     """Convert HuggingFace model to MLX format.
 
@@ -547,6 +548,7 @@ def convert(
         q_group_size: Quantization group size
         quantize_scope: Quantization scope ("attn1" or "all")
         report_layers: Whether to write a layer report JSON
+        loras: Optional list of (path, strength) LoRA weights to merge before quantization
 
     Returns:
         Path to converted model
@@ -583,6 +585,12 @@ def convert(
             k: v.astype(target_dtype) if v.dtype in [mx.float32, mx.float16, mx.bfloat16] else v
             for k, v in weights.items()
         }
+
+    # Apply LoRA deltas if requested (merge before quantization)
+    if loras:
+        from mlx_video.lora import LoraSpec, apply_lora_to_weights
+        lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in loras]
+        weights = apply_lora_to_weights(weights, lora_specs, verbose=True)
 
     # Quantize if requested
     if quantize:
@@ -812,6 +820,13 @@ if __name__ == "__main__":
         default="dev",
         help="Pipeline weights to convert",
     )
+    parser.add_argument(
+        "--lora",
+        nargs=2,
+        action="append",
+        metavar=("PATH", "STRENGTH"),
+        help="LoRA weights to merge before quantization (can be used multiple times): --lora path 0.8",
+    )
 
     args = parser.parse_args()
 
@@ -826,4 +841,5 @@ if __name__ == "__main__":
         quantize_scope=args.quantize_scope,
         report_layers=args.report_layers,
         pipeline=args.pipeline,
+        loras=args.lora,
     )

@@ -523,14 +523,22 @@ class LTXModel(nn.Module):
         return sanitized
 
     @classmethod
-    def from_pretrained(cls, model_path: [Path, List[Path]], config: LTXModelConfig, strict: bool = True) -> None:
+    def from_pretrained(
+        cls,
+        model_path: [Path, List[Path]],
+        config: LTXModelConfig,
+        strict: bool = True,
+        weights_override: dict | None = None,
+    ) -> None:
         model = cls(config)
 
         weights = {}
-        if isinstance(model_path, Path):
-            model_path = [model_path]
-        for weight_file in model_path:
-            weights.update(mx.load(str(weight_file)))
+        model_path_list = model_path if isinstance(model_path, list) else [model_path]
+        if weights_override is not None:
+            weights = dict(weights_override)
+        else:
+            for weight_file in model_path_list:
+                weights.update(mx.load(str(weight_file)))
 
         # Detect PyTorch vs MLX weight format
         is_pytorch = any(k.startswith("model.diffusion_model.") for k in weights)
@@ -548,7 +556,7 @@ class LTXModel(nn.Module):
             mode = "affine"
             predicate = "scales"
             try:
-                meta_path = Path(model_path[0]).parent / "quantization.json"
+                meta_path = Path(model_path_list[0]).parent / "quantization.json"
                 if meta_path.exists():
                     import json
                     with open(meta_path, "r") as f:
