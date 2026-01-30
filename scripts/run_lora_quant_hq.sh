@@ -9,8 +9,31 @@ DEV8="/Users/charafchnioune/Desktop/ltx-2-mlx/converted/ltx2-dev-8bit-mlx"
 DEV4="/Users/charafchnioune/Desktop/ltx-2-mlx/converted/ltx2-dev-4bit-mlx"
 DIS8="/Users/charafchnioune/Desktop/ltx-2-mlx/converted/ltx2-distilled-8bit-mlx"
 DIS4="/Users/charafchnioune/Desktop/ltx-2-mlx/converted/ltx2-distilled-4bit-mlx"
-LORA_PATH="/Users/charafchnioune/Desktop/ltx-2-mlx/loranonmlx/prone_face_cam_v0_2.safetensors"
-LORA_STRENGTH="1.0"
+# Configure one or more LoRAs via LORAS="path:strength;path2:strength".
+# Example:
+#   LORAS="/abs/path/lora_a.safetensors:1.0;/abs/path/lora_b.safetensors:0.7"
+LORAS="${LORAS:-/Users/charafchnioune/Desktop/ltx-2-mlx/loranonmlx/prone_face_cam_v0_2.safetensors:1.0;/Users/charafchnioune/Desktop/ltx-2-mlx/loranonmlx/ltx-2-19b-bwc-lora-35000.safetensors:1.0}"
+
+parse_loras() {
+  local spec="$1"
+  local -a args=()
+  local IFS=';'
+  local entry
+  for entry in $spec; do
+    [[ -z "$entry" ]] && continue
+    local path="${entry%%:*}"
+    local strength="${entry#*:}"
+    if [[ "$path" == "$strength" ]]; then
+      strength="1.0"
+    fi
+    if [[ ! -f "$path" ]]; then
+      echo "[ERROR] LoRA file not found: $path" >&2
+      exit 1
+    fi
+    args+=("--lora" "$path" "$strength")
+  done
+  echo "${args[@]}"
+}
 
 check_model_dir() {
   local dir="$1"
@@ -27,6 +50,8 @@ run_one() {
   local model_dir="$3"
   local height="$4"
   local out_path="$5"
+  local lora_args
+  lora_args="$(parse_loras "$LORAS")"
 
   check_model_dir "$model_dir"
 
@@ -40,7 +65,7 @@ run_one() {
     --steps 20 --cfg-scale 4.5 \
     --seed 42 \
     --audio --verbose \
-    --lora "$LORA_PATH" "$LORA_STRENGTH" \
+    $lora_args \
     --output-path "$out_path"
 }
 

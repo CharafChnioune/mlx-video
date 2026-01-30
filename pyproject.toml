@@ -44,6 +44,7 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 [project.scripts]
 "mlx_video.generate" = "mlx_video.generate:main"
 "ltx_trainer.train" = "ltx_trainer.scripts.train:app"
+"mlx_video.train" = "mlx_video.mlx_trainer.trainer:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*", "ltx_core*", "ltx_pipelines*", "ltx_trainer*"]
