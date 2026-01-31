@@ -10,6 +10,14 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 import cv2
 
+MODEL_REPO_ALIASES = {
+    "ltx2-dev-8bit-mlx": "AITRADER/ltx2-dev-8bit-mlx",
+    "ltx2-dev-4bit-mlx": "AITRADER/ltx2-dev-4bit-mlx",
+    "ltx2-distilled-8bit-mlx": "AITRADER/ltx2-distilled-8bit-mlx",
+    "ltx2-distilled-4bit-mlx": "AITRADER/ltx2-distilled-4bit-mlx",
+}
+
+
 def get_model_path(model_repo: str):
     """Get or download model path.
     
@@ -20,16 +28,17 @@ def get_model_path(model_repo: str):
     Returns:
         Path to the model directory.
     """
-    local_path = Path(model_repo)
+    alias = MODEL_REPO_ALIASES.get(model_repo, model_repo)
+    local_path = Path(alias)
     if local_path.exists() and local_path.is_dir():
         return local_path
     
     try:
-        return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
+        return Path(snapshot_download(repo_id=alias, local_files_only=True))
     except Exception:
         print("Downloading LTX-2 model weights...")
         return Path(snapshot_download(
-            repo_id=model_repo,
+            repo_id=alias,
             local_files_only=False,
             resume_download=True,
             allow_patterns=["*.safetensors", "*.json"],

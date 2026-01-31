@@ -287,6 +287,12 @@ def sanitize_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         if "conv" in new_key.lower() and "weight" in new_key and value.ndim == 4:
             value = mx.transpose(value, (0, 2, 3, 1))
 
+        # Handle Conv1d weight shape conversion for vocoder blocks inside audio_vae
+        # PyTorch: (out_channels, in_channels, kernel)
+        # MLX: (out_channels, kernel, in_channels)
+        if "conv" in new_key.lower() and "weight" in new_key and value.ndim == 3:
+            value = mx.transpose(value, (0, 2, 1))
+
         sanitized[new_key] = value
 
     return sanitized
@@ -352,16 +358,21 @@ def sanitize_audio_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.arr
         weights: Dictionary of weights with PyTorch naming
 
     Returns:
-        Dictionary with MLX-compatible naming for audio VAE decoder
+        Dictionary with MLX-compatible naming for audio VAE encoder/decoder
     """
     sanitized = {}
 
     for key, value in weights.items():
         new_key = key
 
-        # Handle audio_vae.decoder weights
         if key.startswith("audio_vae.decoder."):
-            new_key = key.replace("audio_vae.decoder.", "")
+            new_key = key.replace("audio_vae.decoder.", "decoder.")
+        elif key.startswith("audio_vae.encoder."):
+            new_key = key.replace("audio_vae.encoder.", "encoder.")
+        elif key.startswith("decoder."):
+            new_key = key
+        elif key.startswith("encoder."):
+            new_key = key
         elif key.startswith("audio_vae.per_channel_statistics."):
             # Map per-channel statistics
             if "mean-of-means" in key:
@@ -370,6 +381,9 @@ def sanitize_audio_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.arr
                 new_key = "per_channel_statistics._std_of_means"
             else:
                 continue  # Skip other statistics keys
+        elif key in {"latents_mean", "latents_std"}:
+            # audio_vae/diffusion_pytorch_model.safetensors
+            new_key = "per_channel_statistics._mean_of_means" if key.endswith("mean") else "per_channel_statistics._std_of_means"
         else:
             continue  # Skip non-decoder keys
 
@@ -594,6 +608,22 @@ def convert(
 
     # Quantize if requested
     if quantize:
+        supported = {
+            "affine": {"bits": {2, 3, 4, 5, 6, 8}, "group_size": {32, 64, 128}},
+            "mxfp4": {"bits": {4}, "group_size": {32}},
+            "mxfp8": {"bits": {8}, "group_size": {32}},
+            "nvfp4": {"bits": {4}, "group_size": {16}},
+        }
+        if q_mode not in supported:
+            raise ValueError(f"Unsupported quantization mode: {q_mode}")
+        allowed_bits = supported[q_mode]["bits"]
+        allowed_groups = supported[q_mode]["group_size"]
+        if q_bits not in allowed_bits:
+            raise ValueError(f"q_bits={q_bits} not supported for mode={q_mode}. Allowed: {sorted(allowed_bits)}")
+        if q_group_size not in allowed_groups:
+            raise ValueError(
+                f"q_group_size={q_group_size} not supported for mode={q_mode}. Allowed: {sorted(allowed_groups)}"
+            )
         print(f"Quantizing model (group_size={q_group_size}, bits={q_bits}, mode={q_mode})...")
         model = create_model_from_config(config)
         model.load_weights(list(weights.items()), strict=False)
@@ -638,6 +668,13 @@ def convert(
         )
         from mlx.utils import tree_flatten
         weights = tree_flatten(model.parameters(), destination={})
+        quant_tensors = sum(1 for v in weights.values() if v.dtype == mx.uint32)
+        scale_tensors = sum(1 for k in weights.keys() if ".scales" in k or k.endswith("scales"))
+        bias_tensors = sum(1 for k in weights.keys() if ".biases" in k or ".zeros" in k)
+        print(
+            f"Quantized tensors: {quant_tensors}, scale tensors: {scale_tensors}, "
+            f"bias/zero tensors: {bias_tensors}"
+        )
 
     # Create output directory
     output_path = Path(mlx_path)

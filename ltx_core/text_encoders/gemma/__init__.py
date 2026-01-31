@@ -1,31 +1,10 @@
-"""Gemma text encoder components."""
+"""MLX Gemma text encoder aliases."""
 
-from ltx_core.text_encoders.gemma.encoders.av_encoder import (
-    AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-    AVGemmaEncoderOutput,
-    AVGemmaTextEncoderModel,
-    AVGemmaTextEncoderModelConfigurator,
-)
-from ltx_core.text_encoders.gemma.encoders.base_encoder import (
-    GemmaTextEncoderModelBase,
-    encode_text,
-    module_ops_from_gemma_root,
-)
-from ltx_core.text_encoders.gemma.encoders.video_only_encoder import (
-    VideoGemmaEncoderOutput,
-    VideoGemmaTextEncoderModel,
-    VideoGemmaTextEncoderModelConfigurator,
-)
+from mlx_video.models.ltx.text_encoder import LTX2TextEncoder as AVGemmaTextEncoderModel
 
-__all__ = [
-    "AV_GEMMA_TEXT_ENCODER_KEY_OPS",
-    "AVGemmaEncoderOutput",
-    "AVGemmaTextEncoderModel",
-    "AVGemmaTextEncoderModelConfigurator",
-    "GemmaTextEncoderModelBase",
-    "VideoGemmaEncoderOutput",
-    "VideoGemmaTextEncoderModel",
-    "VideoGemmaTextEncoderModelConfigurator",
-    "encode_text",
-    "module_ops_from_gemma_root",
-]
+
+class GemmaTextEncoderModelBase:  # compatibility stub
+    pass
+
+
+__all__ = ["AVGemmaTextEncoderModel", "GemmaTextEncoderModelBase"]

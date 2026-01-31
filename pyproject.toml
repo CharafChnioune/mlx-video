@@ -45,12 +45,18 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 "mlx_video.generate" = "mlx_video.generate:main"
 "ltx_trainer.train" = "ltx_trainer.scripts.train:app"
 "mlx_video.train" = "mlx_video.mlx_trainer.trainer:main"
+"mlx_video.precompute" = "mlx_video.mlx_trainer.precompute:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*", "ltx_core*", "ltx_pipelines*", "ltx_trainer*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mlx_video.version.__version__"}
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -78,5 +84,6 @@ trainer = [
     "torchvision>=0.21.0",
     "typer>=0.15.1",
     "wandb>=0.19.11",
+    "pyyaml>=6.0.1",
     "setuptools>=80.9.0",
 ]

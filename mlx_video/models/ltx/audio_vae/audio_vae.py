@@ -58,6 +58,166 @@ def run_mid_block(mid: dict, features: mx.array) -> mx.array:
     return mid["block_2"](features, temb=None)
 
 
+class AudioEncoder(nn.Module):
+    """
+    Encoder that compresses audio spectrograms into latent representations.
+    Mirrors the PyTorch AudioEncoder architecture using MLX modules.
+    """
+
+    def __init__(
+        self,
+        *,
+        ch: int = 128,
+        ch_mult: Tuple[int, ...] = (1, 2, 4),
+        num_res_blocks: int = 2,
+        attn_resolutions: Set[int] | None = None,
+        dropout: float = 0.0,
+        resamp_with_conv: bool = True,
+        in_channels: int = 2,
+        resolution: int = 256,
+        z_channels: int = 8,
+        double_z: bool = True,
+        attn_type: AttentionType = AttentionType.VANILLA,
+        mid_block_add_attention: bool = True,
+        norm_type: NormType = NormType.PIXEL,
+        causality_axis: CausalityAxis = CausalityAxis.HEIGHT,
+        sample_rate: int = 16000,
+        mel_hop_length: int = 160,
+        n_fft: int = 1024,
+        is_causal: bool = True,
+        mel_bins: int = 64,
+    ) -> None:
+        super().__init__()
+
+        if attn_resolutions is None:
+            attn_resolutions = set()
+
+        self.per_channel_statistics = PerChannelStatistics(latent_channels=ch)
+        self.sample_rate = sample_rate
+        self.mel_hop_length = mel_hop_length
+        self.n_fft = n_fft
+        self.is_causal = is_causal
+        self.mel_bins = mel_bins
+        self.in_channels = in_channels
+
+        self.patchifier = AudioPatchifier(
+            patch_size=1,
+            audio_latent_downsample_factor=LATENT_DOWNSAMPLE_FACTOR,
+            sample_rate=sample_rate,
+            hop_length=mel_hop_length,
+            is_causal=is_causal,
+        )
+
+        self.ch = ch
+        self.temb_ch = 0
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.z_channels = z_channels
+        self.double_z = double_z
+        self.norm_type = norm_type
+        self.causality_axis = causality_axis
+        self.attn_type = attn_type
+
+        self.conv_in = make_conv2d(
+            in_channels,
+            self.ch,
+            kernel_size=3,
+            stride=1,
+            causality_axis=self.causality_axis,
+        )
+
+        self.down, block_in = build_downsampling_path(
+            ch=ch,
+            ch_mult=ch_mult,
+            num_resolutions=self.num_resolutions,
+            num_res_blocks=num_res_blocks,
+            resolution=resolution,
+            temb_channels=self.temb_ch,
+            dropout=dropout,
+            norm_type=self.norm_type,
+            causality_axis=self.causality_axis,
+            attn_type=self.attn_type,
+            attn_resolutions=attn_resolutions,
+            resamp_with_conv=resamp_with_conv,
+        )
+
+        self.mid = build_mid_block(
+            channels=block_in,
+            temb_channels=self.temb_ch,
+            dropout=dropout,
+            norm_type=self.norm_type,
+            causality_axis=self.causality_axis,
+            attn_type=self.attn_type,
+            add_attention=mid_block_add_attention,
+        )
+
+        self.norm_out = build_normalization_layer(block_in, normtype=self.norm_type)
+        self.conv_out = make_conv2d(
+            block_in,
+            2 * z_channels if double_z else z_channels,
+            kernel_size=3,
+            stride=1,
+            causality_axis=self.causality_axis,
+        )
+
+    def __call__(self, spectrogram: mx.array) -> mx.array:
+        """Encode audio spectrogram into latents.
+
+        Accepts MLX channels-last (B, T, F, C) or PyTorch-style (B, C, T, F).
+        Returns latents in PyTorch-style (B, C, T, F) for trainer compatibility.
+        """
+        if spectrogram.ndim != 4:
+            raise ValueError(f"Expected 4D spectrogram, got shape {spectrogram.shape}")
+
+        # Convert to channels-last if needed
+        if spectrogram.shape[1] == self.in_channels:
+            spectrogram = mx.transpose(spectrogram, (0, 2, 3, 1))
+
+        h = self.conv_in(spectrogram)
+        h = self._run_downsampling_path(h)
+        h = run_mid_block(self.mid, h)
+        h = self._finalize_output(h)
+        latents = self._normalize_latents(h)
+
+        # Return in channels-first layout (B, C, T, F)
+        return mx.transpose(latents, (0, 3, 1, 2))
+
+    def _run_downsampling_path(self, h: mx.array) -> mx.array:
+        for level in range(self.num_resolutions):
+            stage = self.down[level]
+            for block_idx in range(self.num_res_blocks):
+                h = stage["block"][block_idx](h, temb=None)
+                if stage.get("attn") and block_idx in stage["attn"]:
+                    h = stage["attn"][block_idx](h)
+            if level != self.num_resolutions - 1:
+                h = stage["downsample"](h)
+        return h
+
+    def _finalize_output(self, h: mx.array) -> mx.array:
+        h = self.norm_out(h)
+        h = nn.silu(h)
+        return self.conv_out(h)
+
+    def _normalize_latents(self, latent_output: mx.array) -> mx.array:
+        # latent_output: (B, T, F, C) channels-last
+        if self.double_z:
+            means = latent_output[..., : self.z_channels]
+        else:
+            means = latent_output
+
+        latent_shape = AudioLatentShape(
+            batch=means.shape[0],
+            channels=means.shape[3],
+            frames=means.shape[1],
+            mel_bins=means.shape[2],
+        )
+
+        patched = self.patchifier.patchify(means)
+        normalized = self.per_channel_statistics.normalize(patched)
+        return self.patchifier.unpatchify(normalized, latent_shape)
+
+
 class AudioDecoder(nn.Module):
     """
     Symmetric decoder that reconstructs audio spectrograms from latent features.

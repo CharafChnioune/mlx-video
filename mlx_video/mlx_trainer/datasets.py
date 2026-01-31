@@ -7,20 +7,12 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import mlx.core as mx
 
-try:
-    import torch
-    _HAS_TORCH = True
-except Exception:
-    _HAS_TORCH = False
-
 from safetensors import safe_open
 
 PRECOMPUTED_DIR_NAME = ".precomputed"
 
 
 def _to_numpy(obj: Any) -> Any:
-    if _HAS_TORCH and isinstance(obj, torch.Tensor):
-        return obj.detach().cpu().numpy()
     if isinstance(obj, mx.array):
         return np.array(obj)
     if isinstance(obj, np.ndarray):
@@ -35,10 +27,7 @@ def _to_numpy(obj: Any) -> Any:
 
 
 def _load_pt(path: Path) -> Any:
-    if not _HAS_TORCH:
-        raise RuntimeError(f"torch is required to load .pt files: {path}")
-    data = torch.load(path, map_location="cpu")
-    return _to_numpy(data)
+    raise RuntimeError(f".pt files are not supported in the MLX-only trainer: {path}")
 
 
 def _load_npz(path: Path) -> Dict[str, Any]:
@@ -132,7 +121,8 @@ class DummyDataset:
         if self.with_audio:
             audio_latents = {
                 "latents": np.random.randn(8, 69, 16).astype(np.float32),
-                "num_frames": np.array([69], dtype=np.int32),
+                "num_time_steps": np.array([69], dtype=np.int32),
+                "frequency_bins": np.array([16], dtype=np.int32),
             }
 
         return Batch(latents=latents, conditions=conditions, audio_latents=audio_latents)
@@ -237,8 +227,26 @@ class PrecomputedDataset:
         audio_latents = result.get("audio_latents")
         ref_latents = result.get("ref_latents")
 
+        if latents is not None:
+            latents = self._normalize_video_latents(latents)
+
         return Batch(latents=latents, conditions=conditions, audio_latents=audio_latents, ref_latents=ref_latents)
 
+    @staticmethod
+    def _normalize_video_latents(data: Dict[str, Any]) -> Dict[str, Any]:
+        latents = data.get("latents")
+        if not isinstance(latents, np.ndarray):
+            latents = np.array(latents)
+        # Legacy patchified format: [seq_len, C] -> [C, F, H, W]
+        if latents.ndim == 2:
+            num_frames = int(np.array(data["num_frames"]).reshape(-1)[0])
+            height = int(np.array(data["height"]).reshape(-1)[0])
+            width = int(np.array(data["width"]).reshape(-1)[0])
+            latents = latents.reshape(num_frames, height, width, latents.shape[-1])
+            latents = np.transpose(latents, (3, 0, 1, 2))
+            data = data.copy()
+            data["latents"] = latents
+        return data
 
 def collate_batches(batches: List[Batch]) -> Batch:
     def stack_dict(dicts: List[Dict[str, Any]]) -> Dict[str, Any]:

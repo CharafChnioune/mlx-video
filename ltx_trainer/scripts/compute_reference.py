@@ -1,288 +1,140 @@
-"""
-Compute reference videos for IC-LoRA training.
-This script provides a command-line interface for generating reference videos to be used for IC-LoRA training.
-Note that it reads and writes to the same file (the output of caption_videos.py),
-where it adds the "reference_path" field to the JSON.
-Basic usage:
-    # Compute reference videos for all videos in a directory
-    compute_reference.py videos_dir/ --output videos_dir/captions.json
-"""
+#!/usr/bin/env python3
+"""Compute edge-map reference media for IC-LoRA conditioning (MLX-only).
 
-# Standard library imports
+Supports:
+- input directory of media files
+- dataset CSV/JSON/JSONL with media column (adds reference_path column)
+"""
+from __future__ import annotations
+
+import argparse
+import csv
 import json
 from pathlib import Path
-from typing import Dict
 
-# Third-party imports
 import cv2
-import torch
-import torchvision.transforms.functional as TF  # noqa: N812
-import typer
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from transformers.utils.logging import disable_progress_bar
+import numpy as np
+from PIL import Image
 
-# Local imports
-from ltx_trainer.video_utils import read_video, save_video
+from mlx_video.mlx_trainer.video_utils import read_video, save_video
 
-# Initialize console and disable progress bars
-console = Console()
-disable_progress_bar()
+SUPPORTED = {".mp4", ".mov", ".mkv", ".avi", ".png", ".jpg", ".jpeg"}
 
 
-def compute_reference(
-    images: torch.Tensor,
-) -> torch.Tensor:
-    """Compute Canny edge detection on a batch of images.
-    Args:
-        images: Batch of images tensor of shape [B, C, H, W]
-    Returns:
-        Binary edge masks tensor of shape [B, H, W]
-    """
-    # Convert to grayscale if needed
-    if images.shape[1] == 3:
-        images = TF.rgb_to_grayscale(images)
-
-    # Ensure images are in [0, 1] range
-    if images.max() > 1.0:
-        images = images / 255.0
-
-    # Compute Canny edges
-    edge_masks = []
-    for image in images:
-        # Convert to numpy for OpenCV
-        image_np = (image.squeeze().cpu().numpy() * 255).astype("uint8")
-
-        # Apply Canny edge detection
-        edges = cv2.Canny(
-            image_np,
-            threshold1=100,
-            threshold2=200,
-        )
-
-        # Convert back to tensor
-        edge_mask = torch.from_numpy(edges).float()
-        edge_masks.append(edge_mask)
-
-    edges = torch.stack(edge_masks)
-    edges = torch.stack([edges] * 3, dim=1)  # Convert to 3-channel
+def _edges(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 100, 200)
+    edges = np.stack([edges] * 3, axis=-1)
     return edges
 
 
-def _get_meta_data(
-    output_path: Path,
-) -> Dict[str, str]:
-    """Get set of existing reference video paths without loading the actual files.
-    Args:
-        output_path: Path to the reference video paths file
-    Returns:
-        Dictionary mapping media paths to reference video paths
-    """
-    if not output_path.exists():
-        return {}
-
-    console.print(f"[bold blue]Reading meta data from [cyan]{output_path}[/]...[/]")
-
-    try:
-        with output_path.open("r", encoding="utf-8") as f:
-            json_data = json.load(f)
-        return json_data
-
-    except Exception as e:
-        console.print(f"[bold yellow]Warning: Could not check meta data: {e}[/]")
-        return {}
+def _read_dataset(path: Path) -> tuple[list[dict], str]:
+    if path.suffix.lower() == ".csv":
+        with path.open("r", newline="") as f:
+            return list(csv.DictReader(f)), "csv"
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            raise ValueError("JSON dataset must be a list of records")
+        return data, "json"
+    if path.suffix.lower() == ".jsonl":
+        out = []
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            out.append(json.loads(line))
+        return out, "jsonl"
+    raise ValueError(f"Unsupported dataset format: {path}")
 
 
-def _save_dataset_json(
-    reference_paths: Dict[str, str],
-    output_path: Path,
-) -> None:
-    """Save dataset json with reference video paths.
-    Args:
-        reference_paths: Dictionary mapping media paths to reference video paths
-        output_path: Path to save the output file
-    """
-
-    with output_path.open("r", encoding="utf-8") as f:
-        json_data = json.load(f)
-        new_json_data = json_data.copy()
-        for i, item in enumerate(json_data):
-            media_path = item["media_path"]
-            reference_path = reference_paths[media_path]
-            new_json_data[i]["reference_path"] = reference_path
-
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(new_json_data, f, indent=2, ensure_ascii=False)
-
-    console.print(f"[bold green]✓[/] Reference video paths saved to [cyan]{output_path}[/]")
-    console.print("[bold yellow]Note:[/] Use these files with ImageOrVideoDataset by setting:")
-    console.print("  reference_column='[cyan]reference_path[/]'")
-    console.print("  video_column='[cyan]media_path[/]'")
+def _write_dataset(path: Path, records: list[dict], fmt: str) -> None:
+    if fmt == "csv":
+        if not records:
+            return
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=records[0].keys())
+            writer.writeheader()
+            writer.writerows(records)
+        return
+    if fmt == "json":
+        path.write_text(json.dumps(records, indent=2))
+        return
+    if fmt == "jsonl":
+        path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records))
+        return
+    raise ValueError(f"Unsupported format: {fmt}")
 
 
-def process_media(
-    input_path: Path,
-    output_path: Path,
-    override: bool,
-    batch_size: int = 100,
-) -> None:
-    """Process videos and images to compute condition on videos.
-    Args:
-        input_path: Path to input video/image file or directory
-        output_path: Path to output reference video file
-        override: Whether to override existing reference video files
-    """
-    if not output_path.exists():
-        raise FileNotFoundError(
-            f"Output file does not exist: {output_path}. This is also the input file for the dataset."
-        )
-
-    # Check for existing reference video files
-    meta_data = _get_meta_data(output_path)
-
-    base_dir = input_path.resolve()
-    console.print(f"Using [bold blue]{base_dir}[/] as base directory for relative paths")
-
-    # Filter media files
-    media_to_process = []
-    skipped_media = []
-
-    def media_path_to_reference_path(media_file: Path) -> Path:
-        return media_file.parent / (media_file.stem + "_reference" + media_file.suffix)
-
-    media_files = [base_dir / Path(sample["media_path"]) for sample in meta_data]
-    for media_file in media_files:
-        reference_path = media_path_to_reference_path(media_file)
-        media_to_process.append(media_file)
-
-    console.print(f"Processing [bold]{len(media_to_process)}[/] media.")
-
-    # Initialize progress tracking
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TimeRemainingColumn(),
-        console=console,
-    )
-
-    # Process media files
-    media_paths = [item["media_path"] for item in meta_data]
-    reference_paths = {rel_path: str(media_path_to_reference_path(Path(rel_path))) for rel_path in media_paths}
-
-    with progress:
-        task = progress.add_task("Computing condition on videos", total=len(media_to_process))
-
-        for media_file in media_to_process:
-            progress.update(task, description=f"Processing [bold blue]{media_file.name}[/]")
-
-            rel_path = str(media_file.resolve().relative_to(base_dir))
-            reference_path = media_path_to_reference_path(media_file)
-            reference_paths[rel_path] = str(reference_path.relative_to(base_dir))
-
-            if not reference_path.resolve().exists() or override:
-                try:
-                    video, fps = read_video(media_file)
-
-                    # Process frames in batches
-                    condition_frames = []
-
-                    for i in range(0, len(video), batch_size):
-                        batch = video[i : i + batch_size]
-                        condition_batch = compute_reference(batch)
-                        condition_frames.append(condition_batch)
-
-                    # Concatenate all edge frames
-                    all_condition = torch.cat(condition_frames, dim=0)
-
-                    # Save the edge video
-                    save_video(all_condition, reference_path.resolve(), fps=fps)
-
-                except Exception as e:
-                    console.print(f"[bold red]Error processing [bold blue]{media_file}[/]: {e}[/]")
-                    reference_paths.pop(rel_path)
-            else:
-                skipped_media.append(media_file)
-
-            progress.advance(task)
-
-    # Save results
-    _save_dataset_json(reference_paths, output_path)
-
-    # Print summary
-    total_to_process = len(media_files) - len(skipped_media)
-    console.print(
-        f"[bold green]✓[/] Processed [bold]{total_to_process}/{len(media_files)}[/] media successfully.",
-    )
+def _compute_reference_for_media(path: Path, output_path: Path, max_frames: int, override: bool, debug: bool) -> None:
+    if output_path.exists() and not override:
+        if debug:
+            print(f"[reference] skip existing {output_path}")
+        return
+    if path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+        frame = np.array(Image.open(path).convert("RGB"))
+        edge = _edges(frame)
+        Image.fromarray(edge).save(output_path)
+        if debug:
+            print(f"[reference] {path.name} -> image")
+        return
+    frames, fps = read_video(str(path), max_frames=max_frames)
+    edge_frames = np.stack([_edges(f) for f in frames], axis=0)
+    save_video(edge_frames, str(output_path), fps=fps)
+    if debug:
+        print(f"[reference] {path.name} -> {output_path.name}")
 
 
-app = typer.Typer(
-    pretty_exceptions_enable=False,
-    no_args_is_help=True,
-    help="Compute reference videos for IC-LoRA training.",
-)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--dataset-file", default=None)
+    parser.add_argument("--output", default=None, help="Output dataset file (defaults to dataset-file)")
+    parser.add_argument("--media-column", default="media_path")
+    parser.add_argument("--reference-column", default="reference_path")
+    parser.add_argument("--max-frames", type=int, default=16)
+    parser.add_argument("--override", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
 
+    if args.dataset_file:
+        dataset_path = Path(args.dataset_file).expanduser().resolve()
+        records, fmt = _read_dataset(dataset_path)
+        base_dir = dataset_path.parent
+        for rec in records:
+            media = rec.get(args.media_column)
+            if not media:
+                continue
+            media_path = (base_dir / str(media)).resolve()
+            if not media_path.exists():
+                if args.debug:
+                    print(f"[reference] missing media: {media_path}")
+                continue
+            ref_path = media_path.parent / f"{media_path.stem}_reference{media_path.suffix}"
+            _compute_reference_for_media(media_path, ref_path, args.max_frames, args.override, args.debug)
+            rec[args.reference_column] = str(ref_path.relative_to(base_dir))
+        out_path = Path(args.output).expanduser().resolve() if args.output else dataset_path
+        _write_dataset(out_path, records, fmt)
+        if args.debug:
+            print(f"[reference] wrote dataset with references: {out_path}")
+        return
 
-@app.command()
-def main(
-    input_path: Path = typer.Argument(  # noqa: B008
-        ...,
-        help="Path to input video/image file or directory containing media files",
-        exists=True,
-    ),
-    output: Path | None = typer.Option(  # noqa: B008
-        None,
-        "--output",
-        "-o",
-        help="Path to json output file for reference video paths. "
-        "This is also the input file for the dataset, the output of compute_captions.py.",
-    ),
-    override: bool = typer.Option(
-        False,
-        "--override",
-        help="Whether to override existing reference video files",
-    ),
-    batch_size: int = typer.Option(
-        100,
-        "--batch-size",
-        help="Batch size for processing videos",
-    ),
-) -> None:
-    """Compute reference videos for IC-LoRA training.
-    This script generates reference videos (e.g., Canny edge maps) for given videos.
-    The paths in the output file will be relative to the output file's directory.
-    Examples:
-        # Process all videos in a directory
-        compute_reference.py videos_dir/ -o videos_dir/captions.json
-    """
+    if not args.input_dir or not args.output_dir:
+        raise SystemExit("--input-dir/--output-dir or --dataset-file is required.")
 
-    # Ensure output path is absolute
-    output = Path(output).resolve()
-    console.print(f"Output will be saved to [bold blue]{output}[/]")
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Verify output path exists
-    if not output.exists():
-        raise FileNotFoundError(f"Output file does not exist: {output}. This is also the input file for the dataset.")
+    files = [p for p in sorted(input_dir.iterdir()) if p.suffix.lower() in SUPPORTED]
+    if not files:
+        raise SystemExit("No media files found.")
 
-    # Process media files
-    process_media(
-        input_path=input_path,
-        output_path=output,
-        override=override,
-        batch_size=batch_size,
-    )
+    for path in files:
+        out = output_dir / f"{path.stem}_reference{path.suffix}"
+        _compute_reference_for_media(path, out, args.max_frames, args.override, args.debug)
 
 
 if __name__ == "__main__":
-    app()
+    main()

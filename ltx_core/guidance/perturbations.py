@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
 
-import torch
-from torch._prims_common import DeviceLikeType
+import mlx.core as mx
 
 
 class PerturbationType(Enum):
@@ -16,31 +17,24 @@ class PerturbationType(Enum):
 
 @dataclass(frozen=True)
 class Perturbation:
-    """A single perturbation specifying which attention type to skip and in which blocks."""
-
     type: PerturbationType
-    blocks: list[int] | None  # None means all blocks
+    blocks: list[int] | None
 
     def is_perturbed(self, perturbation_type: PerturbationType, block: int) -> bool:
         if self.type != perturbation_type:
             return False
-
         if self.blocks is None:
             return True
-
         return block in self.blocks
 
 
 @dataclass(frozen=True)
 class PerturbationConfig:
-    """Configuration holding a list of perturbations for a single sample."""
-
     perturbations: list[Perturbation] | None
 
     def is_perturbed(self, perturbation_type: PerturbationType, block: int) -> bool:
         if self.perturbations is None:
             return False
-
         return any(perturbation.is_perturbed(perturbation_type, block) for perturbation in self.perturbations)
 
     @staticmethod
@@ -50,23 +44,19 @@ class PerturbationConfig:
 
 @dataclass(frozen=True)
 class BatchedPerturbationConfig:
-    """Perturbation configurations for a batch, with utilities for generating attention masks."""
-
     perturbations: list[PerturbationConfig]
 
-    def mask(
-        self, perturbation_type: PerturbationType, block: int, device: DeviceLikeType, dtype: torch.dtype
-    ) -> torch.Tensor:
-        mask = torch.ones((len(self.perturbations),), device=device, dtype=dtype)
+    def mask(self, perturbation_type: PerturbationType, block: int, device: str | None = None, dtype: mx.Dtype = mx.float32) -> mx.array:
+        mask = mx.ones((len(self.perturbations),), dtype=dtype)
         for batch_idx, perturbation in enumerate(self.perturbations):
             if perturbation.is_perturbed(perturbation_type, block):
-                mask[batch_idx] = 0
-
+                mask = mask.at[batch_idx].set(0)
         return mask
 
-    def mask_like(self, perturbation_type: PerturbationType, block: int, values: torch.Tensor) -> torch.Tensor:
-        mask = self.mask(perturbation_type, block, values.device, values.dtype)
-        return mask.view(mask.numel(), *([1] * len(values.shape[1:])))
+    def mask_like(self, perturbation_type: PerturbationType, block: int, values: mx.array) -> mx.array:
+        mask = self.mask(perturbation_type, block, None, values.dtype)
+        shape = (mask.shape[0],) + (1,) * (values.ndim - 1)
+        return mx.reshape(mask, shape)
 
     def any_in_batch(self, perturbation_type: PerturbationType, block: int) -> bool:
         return any(perturbation.is_perturbed(perturbation_type, block) for perturbation in self.perturbations)

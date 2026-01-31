@@ -1,22 +1,13 @@
-import torch
+from __future__ import annotations
+
+import mlx.core as mx
 
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.utils import to_velocity
 
 
 class EulerDiffusionStep(DiffusionStepProtocol):
-    """
-    First-order Euler method for diffusion sampling.
-    Takes a single step from the current noise level (sigma) to the next by
-    computing velocity from the denoised prediction and applying: sample + velocity * dt.
-    """
-
-    def step(
-        self, sample: torch.Tensor, denoised_sample: torch.Tensor, sigmas: torch.Tensor, step_index: int
-    ) -> torch.Tensor:
-        sigma = sigmas[step_index]
-        sigma_next = sigmas[step_index + 1]
-        dt = sigma_next - sigma
-        velocity = to_velocity(sample, sigma, denoised_sample)
-
-        return (sample.to(torch.float32) + velocity.to(torch.float32) * dt).to(sample.dtype)
+    def execute(self, sample: mx.array, denoised_sample: mx.array, sigmas: mx.array, step_index: int) -> mx.array:
+        velocity = to_velocity(sample, denoised_sample, sigmas[step_index])
+        dt = sigmas[step_index + 1] - sigmas[step_index]
+        return (sample.astype(mx.float32) + velocity.astype(mx.float32) * dt).astype(sample.dtype)

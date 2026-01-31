@@ -1,10 +1,3 @@
-from enum import Enum
+"""MLX wrapper for audio_vae.causality_axis."""
 
-
-class CausalityAxis(Enum):
-    """Enum for specifying the causality axis in causal convolutions."""
-
-    NONE = None
-    WIDTH = "width"
-    HEIGHT = "height"
-    WIDTH_COMPATIBILITY = "width-compatibility"
+from mlx_video.models.ltx.audio_vae.causality_axis import *  # type: ignore

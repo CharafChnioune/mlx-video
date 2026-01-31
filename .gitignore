@@ -5,3 +5,6 @@ claude.md
 __pycache__/*
 *.egg-info/*
 logs/
+scripts/run_lora_quant_hq.sh
+scripts/run_lora_quant_hq.local.sh
+checkpoints/

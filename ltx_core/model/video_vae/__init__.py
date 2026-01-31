@@ -1,24 +1,36 @@
-"""Video VAE package."""
+"""MLX video VAE wrappers."""
 
-from ltx_core.model.video_vae.model_configurator import (
-    VAE_DECODER_COMFY_KEYS_FILTER,
-    VAE_ENCODER_COMFY_KEYS_FILTER,
-    VideoDecoderConfigurator,
-    VideoEncoderConfigurator,
+from mlx_video.models.ltx.video_vae import (  # type: ignore
+    VideoEncoder,
+    VideoDecoder,
+    TilingConfig,
+    SpatialTilingConfig,
+    TemporalTilingConfig,
 )
-from ltx_core.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
-from ltx_core.model.video_vae.video_vae import VideoDecoder, VideoEncoder, decode_video, get_video_chunks_number
+
+# Minimal compat constants
+VAE_ENCODER_COMFY_KEYS_FILTER: dict[str, str] = {}
+VAE_DECODER_COMFY_KEYS_FILTER: dict[str, str] = {}
+
+
+class VideoEncoderConfigurator:
+    def __init__(self, *_, **__):
+        pass
+
+
+class VideoDecoderConfigurator:
+    def __init__(self, *_, **__):
+        pass
+
 
 __all__ = [
-    "VAE_DECODER_COMFY_KEYS_FILTER",
-    "VAE_ENCODER_COMFY_KEYS_FILTER",
+    "VideoEncoder",
+    "VideoDecoder",
+    "TilingConfig",
     "SpatialTilingConfig",
     "TemporalTilingConfig",
-    "TilingConfig",
-    "VideoDecoder",
-    "VideoDecoderConfigurator",
-    "VideoEncoder",
+    "VAE_ENCODER_COMFY_KEYS_FILTER",
+    "VAE_DECODER_COMFY_KEYS_FILTER",
     "VideoEncoderConfigurator",
-    "decode_video",
-    "get_video_chunks_number",
+    "VideoDecoderConfigurator",
 ]

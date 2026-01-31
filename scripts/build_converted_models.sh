@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 OUT="$REPO_ROOT/converted"
 HF_REPO="${HF_REPO:-Lightricks/LTX-2}"
+ENABLE_2BIT="${ENABLE_2BIT:-0}"
 
 echo "==> Resolving HF snapshot for $HF_REPO"
 MODEL_PATH="$("$ROOT"/.venv/bin/python - <<PY
@@ -16,6 +17,9 @@ PY
 mkdir -p "$OUT"
 rm -rf "$OUT/ltx2-dev-8bit-mlx" "$OUT/ltx2-dev-4bit-mlx" \
   "$OUT/ltx2-distilled-8bit-mlx" "$OUT/ltx2-distilled-4bit-mlx"
+if [ "$ENABLE_2BIT" = "1" ]; then
+  rm -rf "$OUT/ltx2-dev-2bit-mlx" "$OUT/ltx2-distilled-2bit-mlx"
+fi
 
 copy_snapshot() {
   local dst="$1"
@@ -28,6 +32,10 @@ copy_snapshot "$OUT/ltx2-dev-8bit-mlx"
 copy_snapshot "$OUT/ltx2-dev-4bit-mlx"
 copy_snapshot "$OUT/ltx2-distilled-8bit-mlx"
 copy_snapshot "$OUT/ltx2-distilled-4bit-mlx"
+if [ "$ENABLE_2BIT" = "1" ]; then
+  copy_snapshot "$OUT/ltx2-dev-2bit-mlx"
+  copy_snapshot "$OUT/ltx2-distilled-2bit-mlx"
+fi
 
 echo "==> Fixing symlinks to HF blobs"
 "$ROOT"/.venv/bin/python - <<PY
@@ -47,7 +55,16 @@ def fix_symlinks(root: Path):
             p.unlink()
             p.symlink_to(abs_target)
 
-for name in ["ltx2-dev-8bit-mlx", "ltx2-dev-4bit-mlx", "ltx2-distilled-8bit-mlx", "ltx2-distilled-4bit-mlx"]:
+names = [
+    "ltx2-dev-8bit-mlx",
+    "ltx2-dev-4bit-mlx",
+    "ltx2-distilled-8bit-mlx",
+    "ltx2-distilled-4bit-mlx",
+]
+if "$ENABLE_2BIT" == "1":
+    names.extend(["ltx2-dev-2bit-mlx", "ltx2-distilled-2bit-mlx"])
+
+for name in names:
     path = converted / name
     if path.exists():
         fix_symlinks(path)
@@ -81,5 +98,21 @@ echo "==> Converting transformer weights (MLX quantized)"
   --dtype bfloat16 \
   --quantize --q-bits 4 --q-group-size 64 --q-mode affine --quantize-scope core --report-layers \
   --pipeline distilled
+
+if [ "$ENABLE_2BIT" = "1" ]; then
+  "$ROOT"/.venv/bin/python -m mlx_video.convert \
+    --hf-path "$HF_REPO" \
+    --mlx-path "$OUT/ltx2-dev-2bit-mlx" \
+    --dtype bfloat16 \
+    --quantize --q-bits 2 --q-group-size 64 --q-mode affine --quantize-scope core --report-layers \
+    --pipeline dev
+
+  "$ROOT"/.venv/bin/python -m mlx_video.convert \
+    --hf-path "$HF_REPO" \
+    --mlx-path "$OUT/ltx2-distilled-2bit-mlx" \
+    --dtype bfloat16 \
+    --quantize --q-bits 2 --q-group-size 64 --q-mode affine --quantize-scope core --report-layers \
+    --pipeline distilled
+fi
 
 echo "==> Done"

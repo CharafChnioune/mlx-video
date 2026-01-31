@@ -1,10 +1,11 @@
-"""Latent upsampler model components."""
+"""MLX latent upsampler wrappers."""
 
-from ltx_core.model.upsampler.model import LatentUpsampler, upsample_video
-from ltx_core.model.upsampler.model_configurator import LatentUpsamplerConfigurator
+from mlx_video.models.ltx.upsampler import LatentUpsampler  # type: ignore
 
-__all__ = [
-    "LatentUpsampler",
-    "LatentUpsamplerConfigurator",
-    "upsample_video",
-]
+
+class LatentUpsamplerConfigurator:
+    def __init__(self, *_, **__):
+        pass
+
+
+__all__ = ["LatentUpsampler", "LatentUpsamplerConfigurator"]

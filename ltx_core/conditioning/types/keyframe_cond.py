@@ -1,4 +1,6 @@
-import torch
+from __future__ import annotations
+
+import mlx.core as mx
 
 from ltx_core.components.patchifiers import get_pixel_coords
 from ltx_core.conditioning.item import ConditioningItem
@@ -7,26 +9,18 @@ from ltx_core.types import LatentState, VideoLatentShape
 
 
 class VideoConditionByKeyframeIndex(ConditioningItem):
-    """
-    Conditions video generation on keyframe latents at a specific frame index.
-    Appends keyframe tokens to the latent state with positions offset by frame_idx,
-    and sets denoise strength according to the strength parameter.
-    """
+    """Conditions video generation on keyframe latents at a specific frame index."""
 
-    def __init__(self, keyframes: torch.Tensor, frame_idx: int, strength: float):
+    def __init__(self, keyframes: mx.array, frame_idx: int, strength: float):
         self.keyframes = keyframes
         self.frame_idx = frame_idx
         self.strength = strength
 
-    def apply_to(
-        self,
-        latent_state: LatentState,
-        latent_tools: VideoLatentTools,
-    ) -> LatentState:
+    def apply_to(self, latent_state: LatentState, latent_tools: VideoLatentTools) -> LatentState:
         tokens = latent_tools.patchifier.patchify(self.keyframes)
         latent_coords = latent_tools.patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape.from_torch_shape(self.keyframes.shape),
-            device=self.keyframes.device,
+            output_shape=VideoLatentShape.from_shape(self.keyframes.shape),
+            device=None,
         )
         positions = get_pixel_coords(
             latent_coords=latent_coords,
@@ -34,20 +28,15 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
             causal_fix=latent_tools.causal_fix if self.frame_idx == 0 else False,
         )
 
-        positions[:, 0, ...] += self.frame_idx
-        positions = positions.to(dtype=torch.float32)
-        positions[:, 0, ...] /= latent_tools.fps
+        positions = positions.astype(mx.float32)
+        positions = positions.at[:, 0, ...].set(positions[:, 0, ...] + self.frame_idx)
+        positions = positions.at[:, 0, ...].set(positions[:, 0, ...] / latent_tools.fps)
 
-        denoise_mask = torch.full(
-            size=(*tokens.shape[:2], 1),
-            fill_value=1.0 - self.strength,
-            device=self.keyframes.device,
-            dtype=self.keyframes.dtype,
-        )
+        denoise_mask = mx.full(tokens.shape[:2] + (1,), 1.0 - self.strength, dtype=self.keyframes.dtype)
 
         return LatentState(
-            latent=torch.cat([latent_state.latent, tokens], dim=1),
-            denoise_mask=torch.cat([latent_state.denoise_mask, denoise_mask], dim=1),
-            positions=torch.cat([latent_state.positions, positions], dim=2),
-            clean_latent=torch.cat([latent_state.clean_latent, tokens], dim=1),
+            latent=mx.concatenate([latent_state.latent, tokens], axis=1),
+            denoise_mask=mx.concatenate([latent_state.denoise_mask, denoise_mask], axis=1),
+            positions=mx.concatenate([latent_state.positions, positions], axis=2),
+            clean_latent=mx.concatenate([latent_state.clean_latent, tokens], axis=1),
         )

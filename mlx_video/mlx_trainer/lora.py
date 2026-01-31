@@ -138,3 +138,27 @@ def export_lora_state(model: nn.Module) -> dict:
             state[f"{key_prefix}.lora_A.weight"] = module.lora_A
             state[f"{key_prefix}.lora_B.weight"] = module.lora_B
     return state
+
+
+def load_lora_state(model: nn.Module, state: dict) -> None:
+    """Load LoRA weights into an injected model."""
+    name_to_module = {}
+    for name, module in model.named_modules():
+        if isinstance(module, (LoRALinear, LoRAQuantizedLinear)):
+            name_to_module[name] = module
+
+    for key, value in state.items():
+        if not key.startswith("diffusion_model."):
+            continue
+        parts = key.split(".")
+        if len(parts) < 3:
+            continue
+        module_name = ".".join(parts[1:-2])
+        param_name = parts[-2]
+        target = name_to_module.get(module_name)
+        if target is None:
+            continue
+        if param_name == "lora_A":
+            target.lora_A = value
+        elif param_name == "lora_B":
+            target.lora_B = value

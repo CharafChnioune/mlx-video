@@ -1,13 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import NamedTuple
 
-import torch
+import mlx.core as mx
 
 
 class VideoPixelShape(NamedTuple):
-    """
-    Shape of the tensor representing the video pixel array. Assumes BGR channel format.
-    """
+    """Shape of decoded video pixels (B, F, H, W, fps)."""
 
     batch: int
     frames: int
@@ -17,10 +17,7 @@ class VideoPixelShape(NamedTuple):
 
 
 class SpatioTemporalScaleFactors(NamedTuple):
-    """
-    Describes the spatiotemporal downscaling between decoded video space and
-    the corresponding VAE latent grid.
-    """
+    """Downscaling factors from pixel space to latent space."""
 
     time: int
     width: int
@@ -35,12 +32,7 @@ VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
 
 class VideoLatentShape(NamedTuple):
-    """
-    Shape of the tensor representing video in VAE latent space.
-    The latent representation is a 5D tensor with dimensions ordered as
-    (batch, channels, frames, height, width). Spatial and temporal dimensions
-    are downscaled relative to pixel space according to the VAE's scale factors.
-    """
+    """Latent tensor shape (B, C, F, H, W)."""
 
     batch: int
     channels: int
@@ -48,11 +40,11 @@ class VideoLatentShape(NamedTuple):
     height: int
     width: int
 
-    def to_torch_shape(self) -> torch.Size:
-        return torch.Size([self.batch, self.channels, self.frames, self.height, self.width])
+    def to_shape(self) -> tuple[int, int, int, int, int]:
+        return (self.batch, self.channels, self.frames, self.height, self.width)
 
     @staticmethod
-    def from_torch_shape(shape: torch.Size) -> "VideoLatentShape":
+    def from_shape(shape: tuple[int, ...]) -> "VideoLatentShape":
         return VideoLatentShape(
             batch=shape[0],
             channels=shape[1],
@@ -70,9 +62,9 @@ class VideoLatentShape(NamedTuple):
         latent_channels: int = 128,
         scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
     ) -> "VideoLatentShape":
-        frames = (shape.frames - 1) // scale_factors[0] + 1
-        height = shape.height // scale_factors[1]
-        width = shape.width // scale_factors[2]
+        frames = (shape.frames - 1) // scale_factors.time + 1
+        height = shape.height // scale_factors.height
+        width = shape.width // scale_factors.width
 
         return VideoLatentShape(
             batch=shape.batch,
@@ -92,24 +84,21 @@ class VideoLatentShape(NamedTuple):
 
 
 class AudioLatentShape(NamedTuple):
-    """
-    Shape of audio in VAE latent space: (batch, channels, frames, mel_bins).
-    mel_bins is the number of frequency bins from the mel-spectrogram encoding.
-    """
+    """Audio latent shape (B, C, T, mel_bins)."""
 
     batch: int
     channels: int
     frames: int
     mel_bins: int
 
-    def to_torch_shape(self) -> torch.Size:
-        return torch.Size([self.batch, self.channels, self.frames, self.mel_bins])
+    def to_shape(self) -> tuple[int, int, int, int]:
+        return (self.batch, self.channels, self.frames, self.mel_bins)
 
     def mask_shape(self) -> "AudioLatentShape":
         return self._replace(channels=1, mel_bins=1)
 
     @staticmethod
-    def from_torch_shape(shape: torch.Size) -> "AudioLatentShape":
+    def from_shape(shape: tuple[int, ...]) -> "AudioLatentShape":
         return AudioLatentShape(
             batch=shape[0],
             channels=shape[1],
@@ -128,7 +117,6 @@ class AudioLatentShape(NamedTuple):
         audio_latent_downsample_factor: int = 4,
     ) -> "AudioLatentShape":
         latents_per_second = float(sample_rate) / float(hop_length) / float(audio_latent_downsample_factor)
-
         return AudioLatentShape(
             batch=batch,
             channels=channels,
@@ -158,24 +146,17 @@ class AudioLatentShape(NamedTuple):
 
 @dataclass(frozen=True)
 class LatentState:
-    """
-    State of latents during the diffusion denoising process.
-    Attributes:
-        latent: The current noisy latent tensor being denoised.
-        denoise_mask: Mask encoding the denoising strength for each token (1 = full denoising, 0 = no denoising).
-        positions: Positional indices for each latent element, used for positional embeddings.
-        clean_latent: Initial state of the latent before denoising, may include conditioning latents.
-    """
+    """Latent diffusion state (MLX)."""
 
-    latent: torch.Tensor
-    denoise_mask: torch.Tensor
-    positions: torch.Tensor
-    clean_latent: torch.Tensor
+    latent: mx.array
+    denoise_mask: mx.array
+    positions: mx.array
+    clean_latent: mx.array
 
     def clone(self) -> "LatentState":
         return LatentState(
-            latent=self.latent.clone(),
-            denoise_mask=self.denoise_mask.clone(),
-            positions=self.positions.clone(),
-            clean_latent=self.clean_latent.clone(),
+            latent=mx.array(self.latent),
+            denoise_mask=mx.array(self.denoise_mask),
+            positions=mx.array(self.positions),
+            clean_latent=mx.array(self.clean_latent),
         )

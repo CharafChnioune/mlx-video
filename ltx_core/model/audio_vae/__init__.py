@@ -1,27 +1,38 @@
-"""Audio VAE model components."""
+"""MLX audio VAE wrappers."""
 
-from ltx_core.model.audio_vae.audio_vae import AudioDecoder, AudioEncoder, decode_audio
-from ltx_core.model.audio_vae.model_configurator import (
-    AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
-    AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
-    VOCODER_COMFY_KEYS_FILTER,
-    AudioDecoderConfigurator,
-    AudioEncoderConfigurator,
-    VocoderConfigurator,
-)
-from ltx_core.model.audio_vae.ops import AudioProcessor
-from ltx_core.model.audio_vae.vocoder import Vocoder
+from mlx_video.models.ltx.audio_vae import AudioDecoder, Vocoder
+
+# Minimal compat constants/aliases
+AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER: dict[str, str] = {}
+AUDIO_VAE_DECODER_COMFY_KEYS_FILTER: dict[str, str] = {}
+VOCODER_COMFY_KEYS_FILTER: dict[str, str] = {}
+
+
+class AudioEncoderConfigurator:
+    def __init__(self, *_, **__):
+        pass
+
+
+class AudioDecoderConfigurator:
+    def __init__(self, *_, **__):
+        pass
+
+
+class VocoderConfigurator:
+    def __init__(self, *_, **__):
+        pass
+
+
+AudioEncoder = AudioDecoder
 
 __all__ = [
-    "AUDIO_VAE_DECODER_COMFY_KEYS_FILTER",
-    "AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER",
-    "VOCODER_COMFY_KEYS_FILTER",
     "AudioDecoder",
-    "AudioDecoderConfigurator",
     "AudioEncoder",
-    "AudioEncoderConfigurator",
-    "AudioProcessor",
     "Vocoder",
+    "AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER",
+    "AUDIO_VAE_DECODER_COMFY_KEYS_FILTER",
+    "VOCODER_COMFY_KEYS_FILTER",
+    "AudioEncoderConfigurator",
+    "AudioDecoderConfigurator",
     "VocoderConfigurator",
-    "decode_audio",
 ]

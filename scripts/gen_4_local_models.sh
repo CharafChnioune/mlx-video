@@ -7,7 +7,7 @@ CONVERTED="$REPO_ROOT/converted"
 OUT="$REPO_ROOT/outputvideos"
 
 PROMPT="${PROMPT:-A cinematic panorama of a mountain landscape at sunrise, mist in the valleys, soft sun rays, birds singing in the background, realistic lighting, filmic look}"
-TEXT_ENCODER_REPO="${TEXT_ENCODER_REPO:-bobwu/gemma-3-12b-it-abliterated-mlx-4Bit}"
+TEXT_ENCODER_REPO="${TEXT_ENCODER_REPO:-msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit}"
 # Use the original LTX-2 text encoder for quant tests to avoid mismatch
 TEXT_ENCODER_REPO_Q="${TEXT_ENCODER_REPO_Q:-Lightricks/LTX-2}"
 

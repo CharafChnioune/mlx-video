@@ -179,7 +179,13 @@ class LanguageModel(nn.Module):
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
 
-            language_model = cls(config=TextConfig.from_dict(config_dict["text_config"]))
+            if "text_config" in config_dict:
+                text_cfg = config_dict["text_config"]
+            else:
+                # Some Gemma MLX repos expose the text config at the top-level.
+                text_cfg = config_dict
+
+            language_model = cls(config=TextConfig.from_dict(text_cfg))
         else:
             raise ValueError(f"Config file not found at {model_path}")
 
@@ -979,4 +985,3 @@ def load_text_encoder(model_path: str = "/tmp/ltx2") -> LTX2TextEncoder:
     encoder = LTX2TextEncoder()
     encoder.load(model_path=model_path)
     return encoder
-

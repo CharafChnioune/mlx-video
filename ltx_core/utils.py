@@ -1,51 +1,54 @@
-from typing import Any
+from __future__ import annotations
 
-import torch
+import mlx.core as mx
+
+from mlx_video.utils import rms_norm as _mlx_rms_norm
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6) -> torch.Tensor:
-    """Root-mean-square (RMS) normalize `x` over its last dimension.
-    Thin wrapper around `torch.nn.functional.rms_norm` that infers the normalized
-    shape and forwards `weight` and `eps`.
+def rms_norm(x: mx.array, weight: mx.array | None = None, eps: float = 1e-6) -> mx.array:
+    """MLX RMS normalization.
+
+    If weight is provided, applies it after normalization (matching torch.rms_norm).
     """
-    return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=weight, eps=eps)
-
-
-def check_config_value(config: dict, key: str, expected: Any) -> None:  # noqa: ANN401
-    actual = config.get(key)
-    if actual != expected:
-        raise ValueError(f"Config value {key} is {actual}, expected {expected}")
-
-
-def to_velocity(
-    sample: torch.Tensor,
-    sigma: float | torch.Tensor,
-    denoised_sample: torch.Tensor,
-    calc_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
-    Convert the sample and its denoised version to velocity.
-    Returns:
-        Velocity
-    """
-    if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype).item()
-    if sigma == 0:
-        raise ValueError("Sigma can't be 0.0")
-    return ((sample.to(calc_dtype) - denoised_sample.to(calc_dtype)) / sigma).to(sample.dtype)
+    if weight is None:
+        return _mlx_rms_norm(x, eps=eps)
+    denom = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)
+    return x / denom * weight
 
 
 def to_denoised(
-    sample: torch.Tensor,
-    velocity: torch.Tensor,
-    sigma: float | torch.Tensor,
-    calc_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
-    Convert the sample and its denoising velocity to denoised sample.
-    Returns:
-        Denoised sample
-    """
-    if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype)
-    return (sample.to(calc_dtype) - velocity.to(calc_dtype) * sigma).to(sample.dtype)
+    sample: mx.array,
+    velocity: mx.array,
+    sigma: float | mx.array,
+    calc_dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """Convert velocity prediction to denoised sample (x0)."""
+    sample_f32 = sample.astype(calc_dtype)
+    velocity_f32 = velocity.astype(calc_dtype)
+    if isinstance(sigma, (int, float)):
+        sigma_f32 = mx.array(sigma, dtype=calc_dtype)
+    else:
+        sigma_f32 = sigma.astype(calc_dtype)
+        while sigma_f32.ndim < velocity_f32.ndim:
+            sigma_f32 = mx.expand_dims(sigma_f32, axis=-1)
+    result = sample_f32 - sigma_f32 * velocity_f32
+    return result.astype(sample.dtype)
+
+
+def to_velocity(
+    sample: mx.array,
+    denoised_sample: mx.array,
+    sigma: float | mx.array,
+    calc_dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """Convert denoised prediction to velocity (v)."""
+    sample_f32 = sample.astype(calc_dtype)
+    denoised_f32 = denoised_sample.astype(calc_dtype)
+    if isinstance(sigma, (int, float)):
+        sigma_f32 = mx.array(sigma, dtype=calc_dtype)
+    else:
+        sigma_f32 = sigma.astype(calc_dtype)
+        while sigma_f32.ndim < denoised_f32.ndim:
+            sigma_f32 = mx.expand_dims(sigma_f32, axis=-1)
+    result = (sample_f32 - denoised_f32) / sigma_f32
+    return result.astype(sample.dtype)
