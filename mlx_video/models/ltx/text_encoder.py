@@ -3,6 +3,7 @@
 import functools
 import logging
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,15 @@ from mlx_vlm.models.gemma3.config import TextConfig
 
 # Path to system prompts
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("LTX_DEBUG") == "1"
+
+
+def _debug_log(message: str) -> None:
+    if _debug_enabled():
+        print(f"[debug][text_encoder] {message}")
 
 
 def _load_system_prompt(prompt_name: str) -> str:
@@ -661,6 +671,8 @@ class LTX2TextEncoder(nn.Module):
 
         if Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
             text_encoder_path = str(Path(text_encoder_path) / "text_encoder")
+
+        _debug_log(f"model_path={model_path} text_encoder_path={text_encoder_path}")
         
         # Track whether we should include special tokens for prompt enhancement.
         self._enhance_add_special_tokens = False
@@ -687,6 +699,8 @@ class LTX2TextEncoder(nn.Module):
             transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
             if transformer_files:
                 transformer_weights = mx.load(str(transformer_files[0]))
+        if transformer_weights:
+            _debug_log(f"connector_weights_keys={len(transformer_weights)}")
 
         if transformer_weights:
             # Load feature extractor (aggregate_embed)
@@ -724,6 +738,8 @@ class LTX2TextEncoder(nn.Module):
                         transformer_weights = base_weights
                 except Exception:
                     pass
+
+            _debug_log(f"video_connector_keys={len(connector_weights)}")
 
             if connector_weights:
                 # Map weight names to our structure
@@ -766,6 +782,7 @@ class LTX2TextEncoder(nn.Module):
                     new_key = new_key.replace(".to_out.0.", ".to_out.")
                     mapped_audio_weights[new_key] = value
 
+                _debug_log(f"audio_connector_keys={len(mapped_audio_weights)}")
                 self.audio_embeddings_connector.load_weights(
                     list(mapped_audio_weights.items()), strict=False
                 )

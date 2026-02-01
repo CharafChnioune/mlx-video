@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -18,6 +19,15 @@ from mlx_video.models.ltx.transformer import (
     TransformerArgs,
 )
 from mlx_video.utils import to_denoised
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("LTX_DEBUG") == "1"
+
+
+def _debug_log(message: str) -> None:
+    if _debug_enabled():
+        print(f"[debug][ltx] {message}")
 
 
 class TransformerArgsPreprocessor:
@@ -540,12 +550,28 @@ class LTXModel(nn.Module):
             for weight_file in model_path_list:
                 weights.update(mx.load(str(weight_file)))
 
+        if _debug_enabled():
+            total = len(weights)
+            scales = sum(1 for k in weights if k.endswith(".scales"))
+            biases = sum(1 for k in weights if k.endswith(".biases"))
+            dtypes = {}
+            for v in weights.values():
+                key = str(v.dtype)
+                dtypes[key] = dtypes.get(key, 0) + 1
+            _debug_log(
+                f"from_pretrained files={[str(p) for p in model_path_list]} "
+                f"keys={total} scales={scales} biases={biases} dtypes={dtypes}"
+            )
+
         # Detect PyTorch vs MLX weight format
         is_pytorch = any(k.startswith("model.diffusion_model.") for k in weights)
         if is_pytorch:
             sanitized = model.sanitize(weights)
         else:
             sanitized = weights
+
+        if _debug_enabled():
+            _debug_log(f"is_pytorch={is_pytorch} strict={strict}")
 
         # If quantized weights are present, configure quantization before loading
         has_quant = any(k.endswith(".scales") or k.endswith(".biases") for k in sanitized)
@@ -567,6 +593,12 @@ class LTXModel(nn.Module):
                     predicate = meta.get("predicate", predicate)
             except Exception:
                 pass
+
+            if _debug_enabled():
+                _debug_log(
+                    f"quantize: group_size={group_size} bits={bits} mode={mode} "
+                    f"predicate={predicate}"
+                )
 
             def _attn1_only_predicate(p, m):
                 if not hasattr(m, "to_quantized"):
@@ -595,7 +627,12 @@ class LTXModel(nn.Module):
             def _scales_predicate(p, m):
                 return f"{p}.scales" in sanitized
 
-            if predicate == "attn1_only":
+            # When loading already-quantized weights, rely on the saved .scales
+            # tensors to decide which modules to quantize. This avoids mismatches
+            # if quantization.json metadata is incomplete or uses a broader scope.
+            if has_quant:
+                pred = _scales_predicate
+            elif predicate == "attn1_only":
                 pred = _attn1_only_predicate
             elif predicate == "core":
                 pred = _core_predicate
@@ -609,6 +646,10 @@ class LTXModel(nn.Module):
                 mode=mode,
                 class_predicate=pred,
             )
+
+            if _debug_enabled():
+                q_modules = sum(1 for _, m in model.named_modules() if hasattr(m, "scales"))
+                _debug_log(f"quantized modules={q_modules}")
 
             # For quantized weights, keep scale/bias dtype as saved, cast others to bfloat16
             sanitized = {

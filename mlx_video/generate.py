@@ -24,6 +24,58 @@ from rich.panel import Panel
 console = Console()
 
 
+def _debug_enabled() -> bool:
+    return os.environ.get("LTX_DEBUG") == "1"
+
+
+def _debug_log(message: str) -> None:
+    if _debug_enabled():
+        console.print(f"[dim][debug] {message}[/]")
+
+
+def _debug_stats(name: str, tensor: Optional[mx.array]) -> None:
+    if not _debug_enabled() or tensor is None:
+        return
+    try:
+        t = tensor.astype(mx.float32)
+        mn = mx.min(t)
+        mxv = mx.max(t)
+        mean = mx.mean(t)
+        std = mx.std(t)
+        mx.eval(mn, mxv, mean, std)
+        console.print(
+            "[dim][debug] "
+            f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"min={float(mn.item()):.6f} max={float(mxv.item()):.6f} "
+            f"mean={float(mean.item()):.6f} std={float(std.item()):.6f}[/]"
+        )
+    except Exception as exc:
+        console.print(f"[dim][debug] {name}: <stats error> {exc}[/]")
+
+
+def _debug_weights_summary(label: str, weights_path: Optional[Path]) -> None:
+    if not _debug_enabled():
+        return
+    try:
+        if weights_path is None:
+            _debug_log(f"{label}: <missing path>")
+            return
+        weights_path = Path(weights_path)
+        if not weights_path.exists():
+            _debug_log(f"{label}: missing {weights_path}")
+            return
+        weights = mx.load(str(weights_path))
+        total = len(weights)
+        scales = sum(1 for k in weights if k.endswith(".scales"))
+        biases = sum(1 for k in weights if k.endswith(".biases"))
+        dtypes = {}
+        for v in weights.values():
+            key = str(v.dtype)
+            dtypes[key] = dtypes.get(key, 0) + 1
+        _debug_log(f"{label}: {weights_path} keys={total} scales={scales} biases={biases} dtypes={dtypes}")
+    except Exception as exc:
+        _debug_log(f"{label}: <failed to load> {exc}")
+
 from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType, LTXRopeType
 from mlx_video.models.ltx.ltx import LTXModel
 from mlx_video.models.ltx.transformer import Modality
@@ -407,6 +459,9 @@ def denoise_distilled(
 
             progress.advance(task)
 
+    _debug_stats("latents_after_denoise_distilled", latents)
+    if enable_audio:
+        _debug_stats("audio_latents_after_denoise_distilled", audio_latents)
     return latents, audio_latents if enable_audio else None
 
 
@@ -525,6 +580,7 @@ def denoise_dev(
             mx.eval(latents)
             progress.advance(task)
 
+    _debug_stats("latents_after_denoise_dev", latents)
     return latents
 
 
@@ -681,6 +737,8 @@ def denoise_dev_av(
             mx.eval(video_latents, audio_latents)
             progress.advance(task)
 
+    _debug_stats("video_latents_after_denoise_dev_av", video_latents)
+    _debug_stats("audio_latents_after_denoise_dev_av", audio_latents)
     return video_latents, audio_latents
 
 
@@ -1043,6 +1101,11 @@ def generate_video(
     else:
         model_path = get_model_path(model_repo)
 
+    _debug_log(
+        f"pipeline={pipeline.value} model_repo={model_repo} model_path={model_path} "
+        f"checkpoint_path={checkpoint_path}"
+    )
+
     default_text_encoder = os.environ.get(
         "LTX_TEXT_ENCODER_REPO",
         "msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit",
@@ -1056,6 +1119,17 @@ def generate_video(
             text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
     else:
         text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
+
+    _debug_log(f"text_encoder_repo={text_encoder_repo} text_encoder_path={text_encoder_path}")
+    quant_meta_path = model_path / "quantization.json"
+    if quant_meta_path.exists():
+        try:
+            import json
+            with quant_meta_path.open("r") as f:
+                quant_meta = json.load(f)
+            _debug_log(f"quantization.json={quant_meta}")
+        except Exception as exc:
+            _debug_log(f"quantization.json read error: {exc}")
 
     # Auto-generate a descriptive output name from the prompt (optional)
     if auto_output_name:
@@ -1094,6 +1168,12 @@ def generate_video(
     mlx_weight_file = model_path / f"ltx-2-19b-{'dev' if is_dev_pipeline else 'distilled'}-mlx.safetensors"
     transformer_weight_path = explicit_weight_path or (mlx_weight_file if mlx_weight_file.exists() else model_path / weight_file)
 
+    _debug_log(f"weight_file={weight_file} weight_file_path={weight_file_path}")
+    _debug_log(f"mlx_weight_file={mlx_weight_file} transformer_weight_path={transformer_weight_path}")
+    _debug_weights_summary("transformer_weights", transformer_weight_path)
+    if weight_file_path != transformer_weight_path:
+        _debug_weights_summary("base_weights", weight_file_path)
+
     # Calculate latent dimensions
     if is_distilled_pipeline:
         stage1_h, stage1_w = height // 2 // 32, width // 2 // 32
@@ -1115,16 +1195,39 @@ def generate_video(
 
     def _resolve_vae_source() -> Path:
         """Resolve a VAE source path for decoding (no cross-repo fallback)."""
-        # Prefer dedicated VAE weights inside the selected model repo.
-        if (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-            return model_path
         # Prefer full (non-MLX) weights inside the same repo (contains VAE stats/decoder).
         base_weight = model_path / weight_file
         if base_weight.exists():
+            _debug_log(f"vae_source=base_weight {base_weight}")
             return base_weight
+        # Fall back to dedicated VAE weights inside the selected model repo,
+        # but prefer a known-good base VAE for quantized snapshots if provided.
+        if (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+            if (model_path / "quantization.json").exists():
+                override_repo = os.environ.get("LTX_VAE_REPO")
+                if override_repo:
+                    try:
+                        override_path = get_model_path(override_repo, require_files=False)
+                        override_weight = Path(override_path) / weight_file
+                        if override_weight.exists():
+                            _debug_log(f"vae_source=override_repo {override_repo} {override_weight}")
+                            return override_weight
+                    except Exception as exc:
+                        _debug_log(f"vae_source override error: {exc}")
+                try:
+                    base_path = get_model_path("Lightricks/LTX-2", require_files=False)
+                    base_weight_fallback = Path(base_path) / weight_file
+                    if base_weight_fallback.exists():
+                        _debug_log(f"vae_source=base_fallback {base_weight_fallback}")
+                        return base_weight_fallback
+                except Exception as exc:
+                    _debug_log(f"vae_source base fallback error: {exc}")
+            _debug_log(f"vae_source=repo_vae {model_path}")
+            return model_path
         # If an explicit checkpoint is provided and isn't the quantized MLX file, use it.
         if explicit_weight_path and explicit_weight_path.exists():
             if not explicit_weight_path.name.endswith("-mlx.safetensors"):
+                _debug_log(f"vae_source=explicit {explicit_weight_path}")
                 return explicit_weight_path
         raise FileNotFoundError(
             "VAE weights not found in the selected model repo. "
@@ -1156,21 +1259,30 @@ def generate_video(
             video_embeddings_neg, audio_embeddings_neg = text_encoder(negative_prompt, return_audio_embeddings=True)
             model_dtype = video_embeddings_pos.dtype
             mx.eval(video_embeddings_pos, video_embeddings_neg, audio_embeddings_pos, audio_embeddings_neg)
+            _debug_stats("video_embeddings_pos", video_embeddings_pos)
+            _debug_stats("video_embeddings_neg", video_embeddings_neg)
+            _debug_stats("audio_embeddings_pos", audio_embeddings_pos)
+            _debug_stats("audio_embeddings_neg", audio_embeddings_neg)
         else:
             video_embeddings_pos, _ = text_encoder(prompt, return_audio_embeddings=False)
             video_embeddings_neg, _ = text_encoder(negative_prompt, return_audio_embeddings=False)
             audio_embeddings_pos = audio_embeddings_neg = None
             model_dtype = video_embeddings_pos.dtype
             mx.eval(video_embeddings_pos, video_embeddings_neg)
+            _debug_stats("video_embeddings_pos", video_embeddings_pos)
+            _debug_stats("video_embeddings_neg", video_embeddings_neg)
     else:
         # Distilled pipeline - single embedding
         if audio:
             text_embeddings, audio_embeddings = text_encoder(prompt, return_audio_embeddings=True)
             mx.eval(text_embeddings, audio_embeddings)
+            _debug_stats("text_embeddings", text_embeddings)
+            _debug_stats("audio_embeddings", audio_embeddings)
         else:
             text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
             audio_embeddings = None
             mx.eval(text_embeddings)
+            _debug_stats("text_embeddings", text_embeddings)
         model_dtype = text_embeddings.dtype
 
     del text_encoder
@@ -1207,6 +1319,15 @@ def generate_video(
             audio_positional_embedding_max_pos=[20],
         )
     config = LTXModelConfig(**config_kwargs)
+    _debug_log(
+        "config: "
+        f"model_type={config.model_type} num_layers={config.num_layers} "
+        f"num_attention_heads={config.num_attention_heads} "
+        f"attention_head_dim={config.attention_head_dim} "
+        f"cross_attention_dim={config.cross_attention_dim} "
+        f"caption_channels={config.caption_channels} "
+        f"rope_type={config.rope_type} double_precision_rope={config.double_precision_rope}"
+    )
 
     def _load_transformer_with_loras(lora_list: Optional[list[tuple[str, float]]]):
         transformer_local = None
@@ -1437,6 +1558,9 @@ def generate_video(
         else:
             latents = mx.random.normal((1, 128, latent_frames, stage1_h, stage1_w), dtype=model_dtype)
             mx.eval(latents)
+        _debug_stats("latents_stage1_initial", latents)
+        if audio_latents is not None:
+            _debug_stats("audio_latents_stage1_initial", audio_latents)
 
         latents, audio_latents = denoise_distilled(
             latents, positions, text_embeddings, transformer, STAGE_1_SIGMAS,
@@ -1454,6 +1578,7 @@ def generate_video(
 
             latents = upsample_latents(latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
             mx.eval(latents)
+            _debug_stats("latents_after_upsample", latents)
 
             del upsampler
             mx.clear_cache()
@@ -1514,6 +1639,9 @@ def generate_video(
                 audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
                 audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
                 mx.eval(audio_latents)
+        _debug_stats("latents_stage2_initial", latents)
+        if audio_latents is not None:
+            _debug_stats("audio_latents_stage2_initial", audio_latents)
 
         latents, audio_latents = denoise_distilled(
             latents, positions, text_embeddings, transformer, STAGE_2_SIGMAS,
@@ -1597,6 +1725,9 @@ def generate_video(
         else:
             latents = mx.random.normal(video_latent_shape, dtype=model_dtype)
             mx.eval(latents)
+        _debug_stats("latents_initial", latents)
+        if audio_latents is not None:
+            _debug_stats("audio_latents_initial", audio_latents)
 
         # Denoise with CFG
         if audio:
@@ -1696,9 +1827,11 @@ def generate_video(
         spatial_info = f"{tiling_config.spatial_config.tile_size_in_pixels}px" if tiling_config.spatial_config else "none"
         temporal_info = f"{tiling_config.temporal_config.tile_size_in_frames}f" if tiling_config.temporal_config else "none"
         console.print(f"[dim]  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}[/]")
+        _debug_stats("latents_pre_decode", latents)
         video = vae_decoder.decode_tiled(latents, tiling_config=tiling_config, tiling_mode=tiling, debug=verbose, on_frames_ready=on_frames_ready)
     else:
         console.print("[dim]  Tiling: disabled[/]")
+        _debug_stats("latents_pre_decode", latents)
         video = vae_decoder(latents)
     mx.eval(video)
     mx.clear_cache()
@@ -1992,6 +2125,7 @@ Examples:
     parser.add_argument("--stg-blocks", type=int, nargs="*", default=None, help="(PyTorch parity) Not implemented in MLX; ignored.")
     parser.add_argument("--stg-mode", type=str, choices=["stg_av", "stg_v"], default=None, help="(PyTorch parity) Not implemented in MLX; ignored.")
     args = parser.parse_args()
+
 
     if args.frame_rate is not None:
         args.fps = args.frame_rate

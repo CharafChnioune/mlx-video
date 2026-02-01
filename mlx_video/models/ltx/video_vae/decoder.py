@@ -524,7 +524,15 @@ class LTX2VideoDecoder(nn.Module):
 def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = None) -> LTX2VideoDecoder:
     from pathlib import Path
     import json
+    import os
     from safetensors import safe_open
+
+    def _debug_enabled() -> bool:
+        return os.environ.get("LTX_DEBUG") == "1"
+
+    def _debug_log(message: str) -> None:
+        if _debug_enabled():
+            print(f"[debug][vae] {message}")
 
     model_path = Path(model_path)
 
@@ -542,6 +550,8 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
         raise FileNotFoundError(f"VAE weights not found at {model_path}")
 
     print(f"Loading VAE decoder from {weights_path}...")
+    if _debug_enabled():
+        _debug_log(f"weights_path={weights_path} size={weights_path.stat().st_size if weights_path.exists() else 'missing'}")
 
     # Read config from safetensors metadata to auto-detect timestep_conditioning
     if timestep_conditioning is None:
@@ -562,6 +572,11 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
     decoder = LTX2VideoDecoder(timestep_conditioning=timestep_conditioning)
 
     weights = mx.load(str(weights_path))
+    if _debug_enabled():
+        total = len(weights)
+        has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
+        has_decoder_prefix = any(k.startswith("decoder.") for k in weights.keys())
+        _debug_log(f"weights keys={total} has_vae_prefix={has_vae_prefix} has_decoder_prefix={has_decoder_prefix}")
 
     # Determine prefix based on weight keys
     has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
