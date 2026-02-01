@@ -107,16 +107,12 @@ python -m mlx_video.generate \
 ```bash
 # Default enhancer (uses the loaded text encoder)
 python -m mlx_video.generate --prompt "A mountain lake at dawn" --enhance-prompt
-
-# YOLO enhancer (msntest2014 Gemma 3 12B 4-bit)
-python -m mlx_video.generate --prompt "A mountain lake at dawn" --enhance-prompt-yolo
 ```
 
 ### Auto Output Naming (optional)
 
 ```bash
 python -m mlx_video.generate --prompt "A mountain lake at dawn" --auto-output-name
-python -m mlx_video.generate --prompt "A mountain lake at dawn" --auto-output-name-yolo
 ```
 
 ### CLI Options
@@ -142,9 +138,7 @@ python -m mlx_video.generate --prompt "A mountain lake at dawn" --auto-output-na
 | `--distilled-lora` | (none) | Stage-2 LoRA for distilled pipeline |
 | `--audio` | false | Enable synchronized audio |
 | `--enhance-prompt` | false | Enable prompt enhancement using the loaded text encoder |
-| `--enhance-prompt-yolo` | false | Prompt enhancement using `msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit` |
 | `--auto-output-name` | false | Auto-generate filename from prompt using Gemma |
-| `--auto-output-name-yolo` | false | Auto-generate filename using `msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit` |
 | `--output-audio` | (none) | Save audio to custom path |
 | `--stream` | false | Stream frames during decode |
 | `--checkpoint-path`, `--checkpoint` | (none) | Optional explicit checkpoint path |

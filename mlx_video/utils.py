@@ -18,7 +18,24 @@ MODEL_REPO_ALIASES = {
 }
 
 
-def get_model_path(model_repo: str):
+def _required_model_files() -> list[str]:
+    return [
+        "vae/diffusion_pytorch_model.safetensors",
+        "audio_vae/diffusion_pytorch_model.safetensors",
+        "vocoder/diffusion_pytorch_model.safetensors",
+        "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+        "ltx-2-temporal-upscaler-x2-1.0.safetensors",
+    ]
+
+
+def _has_required_files(path: Path) -> bool:
+    return all((path / rel).exists() for rel in _required_model_files())
+
+def _needs_connectors(repo_id: str) -> bool:
+    return str(repo_id).startswith("AITRADER/ltx2-")
+
+
+def get_model_path(model_repo: str, require_files: bool = True):
     """Get or download model path.
     
     Args:
@@ -34,15 +51,43 @@ def get_model_path(model_repo: str):
         return local_path
     
     try:
-        return Path(snapshot_download(repo_id=alias, local_files_only=True))
+        local = Path(snapshot_download(repo_id=alias, local_files_only=True))
+        if require_files and not _has_required_files(local):
+            local = None
+        if local is not None and _needs_connectors(alias):
+            connector_file = local / "connectors" / "ltx_text_connectors.safetensors"
+            if not connector_file.exists():
+                local = None
+        if local is not None:
+            return local
     except Exception:
-        print("Downloading LTX-2 model weights...")
-        return Path(snapshot_download(
+        local = None
+
+    print("Downloading LTX-2 model weights...")
+    downloaded = Path(
+        snapshot_download(
             repo_id=alias,
             local_files_only=False,
             resume_download=True,
-            allow_patterns=["*.safetensors", "*.json"],
-        ))
+            allow_patterns=[
+                "*.safetensors",
+                "*.json",
+                "vae/*",
+                "audio_vae/*",
+                "vocoder/*",
+                "connectors/*",
+                "text_encoder/*",
+                "tokenizer/*",
+                "scheduler/*",
+            ],
+        )
+    )
+    if require_files and (not _has_required_files(downloaded)):
+        raise FileNotFoundError(
+            "Model download completed but required VAE/audio/vocoder files are missing. "
+            "Ensure the repo contains vae/audio_vae/vocoder and retry."
+        )
+    return downloaded
 
 def apply_quantization(model: nn.Module, weights: mx.array, quantization: dict):
     if quantization is not None:

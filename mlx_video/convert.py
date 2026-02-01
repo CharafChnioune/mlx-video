@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType
+from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType, LTXRopeType
 from mlx_video.models.ltx.ltx import LTXModel
 from mlx_video.models.ltx.attention import Attention
 
@@ -503,6 +503,34 @@ def load_config(model_path: Path) -> Dict[str, Any]:
     return {}
 
 
+def _default_ltx_config() -> Dict[str, Any]:
+    return {
+        "model_type": "ltx av model",
+        "num_attention_heads": 32,
+        "attention_head_dim": 128,
+        "in_channels": 128,
+        "out_channels": 128,
+        "num_layers": 48,
+        "cross_attention_dim": 4096,
+        "caption_channels": 3840,
+        "audio_num_attention_heads": 32,
+        "audio_attention_head_dim": 64,
+        "audio_in_channels": 128,
+        "audio_out_channels": 128,
+        "audio_cross_attention_dim": 2048,
+        "audio_caption_channels": 3840,
+        "positional_embedding_theta": 10000.0,
+        "positional_embedding_max_pos": [20, 2048, 2048],
+        "audio_positional_embedding_max_pos": [20],
+        "use_middle_indices_grid": True,
+        "rope_type": "split",
+        "double_precision_rope": True,
+        "timestep_scale_multiplier": 1000,
+        "av_ca_timestep_scale_multiplier": 1000,
+        "norm_eps": 1e-6,
+    }
+
+
 def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
     """Create model instance from configuration.
 
@@ -513,6 +541,9 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
         LTXModel instance
     """
     # Map config to LTXModelConfig
+    rope_type = config.get("rope_type", "split")
+    if isinstance(rope_type, str):
+        rope_type = LTXRopeType.SPLIT if rope_type.lower() == "split" else LTXRopeType.INTERLEAVED
     model_config = LTXModelConfig(
         model_type=LTXModelType.AudioVideo,
         num_attention_heads=config.get("num_attention_heads", 32),
@@ -527,9 +558,13 @@ def create_model_from_config(config: Dict[str, Any]) -> LTXModel:
         audio_in_channels=config.get("audio_in_channels", 128),
         audio_out_channels=config.get("audio_out_channels", 128),
         audio_cross_attention_dim=config.get("audio_cross_attention_dim", 2048),
+        audio_caption_channels=config.get("audio_caption_channels", 3840),
         positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
         positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
         audio_positional_embedding_max_pos=config.get("audio_positional_embedding_max_pos", [20]),
+        use_middle_indices_grid=config.get("use_middle_indices_grid", True),
+        rope_type=rope_type,
+        double_precision_rope=config.get("double_precision_rope", True),
         timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
         av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1000),
         norm_eps=config.get("norm_eps", 1e-6),
@@ -572,6 +607,8 @@ def convert(
 
     # Load config
     config = load_config(model_path)
+    if not config:
+        config = _default_ltx_config()
 
     # Load transformer weights for the requested pipeline
     print("Loading transformer weights...")
@@ -581,6 +618,16 @@ def convert(
     if not weight_file.exists():
         raise FileNotFoundError(f"Missing weight file: {weight_file}")
     raw_weights = mx.load(str(weight_file))
+
+    # Extract text connector weights for the text encoder (small, needed for prompt conditioning)
+    connector_weights: Dict[str, mx.array] = {}
+    for key, value in raw_weights.items():
+        if key.startswith("text_embedding_projection."):
+            connector_weights[key] = value
+        elif key.startswith("model.diffusion_model.video_embeddings_connector."):
+            connector_weights[key] = value
+        elif key.startswith("model.diffusion_model.audio_embeddings_connector."):
+            connector_weights[key] = value
 
     # Sanitize transformer weights only
     print("Sanitizing transformer weights...")
@@ -684,6 +731,13 @@ def convert(
     out_name = f"ltx-2-19b-{pipeline}-mlx.safetensors"
     print(f"Saving weights to {output_path / out_name}...")
     mx.save_safetensors(str(output_path / out_name), weights)
+
+    # Save text connector weights (if available)
+    if connector_weights:
+        connectors_dir = output_path / "connectors"
+        connectors_dir.mkdir(parents=True, exist_ok=True)
+        connectors_path = connectors_dir / "ltx_text_connectors.safetensors"
+        mx.save_safetensors(str(connectors_path), connector_weights)
 
     # Save config
     config_out_path = output_path / "config.json"

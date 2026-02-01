@@ -172,8 +172,20 @@ class LanguageModel(nn.Module):
     @classmethod
     def from_pretrained(cls, model_path: str):
         import json
-        weight_files = sorted(Path(model_path).glob("*.safetensors"))
-        config_file = Path(model_path) / "config.json"
+        path = Path(model_path)
+        config_file = path / "config.json"
+
+        if not config_file.exists():
+            # Try resolving HF repo id to a local snapshot
+            try:
+                from huggingface_hub import snapshot_download
+                resolved = snapshot_download(repo_id=model_path)
+                path = Path(resolved)
+                config_file = path / "config.json"
+            except Exception:
+                pass
+
+        weight_files = sorted(path.glob("*.safetensors"))
         config_dict = {}
         if config_file.exists():
             with open(config_file, "r") as f:
@@ -650,13 +662,33 @@ class LTX2TextEncoder(nn.Module):
         if Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
             text_encoder_path = str(Path(text_encoder_path) / "text_encoder")
         
+        # Track whether we should include special tokens for prompt enhancement.
+        self._enhance_add_special_tokens = False
+        try:
+            tp = Path(str(text_encoder_path))
+            mp = Path(model_path) if model_path is not None else None
+            if mp is not None:
+                # Use special tokens when the text encoder is external to the base model snapshot.
+                if not (str(tp).startswith(str(mp))):
+                    self._enhance_add_special_tokens = True
+        except Exception:
+            # Fallback: assume external repo
+            self._enhance_add_special_tokens = True
+
         self.language_model = LanguageModel.from_pretrained(text_encoder_path)
 
-        # Load transformer weights for feature extractor and connector
-        transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
-        if transformer_files:
-            transformer_weights = mx.load(str(transformer_files[0]))
+        # Load connector weights (prefer small connector file if present)
+        transformer_weights = {}
+        connector_file = model_path / "connectors" / "ltx_text_connectors.safetensors"
+        if connector_file.exists():
+            print(f"[TextEncoder] Using connector weights from {connector_file}")
+            transformer_weights = mx.load(str(connector_file))
+        else:
+            transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
+            if transformer_files:
+                transformer_weights = mx.load(str(transformer_files[0]))
 
+        if transformer_weights:
             # Load feature extractor (aggregate_embed)
             if "text_embedding_projection.aggregate_embed.weight" in transformer_weights:
                 self.feature_extractor.aggregate_embed.weight = transformer_weights[
@@ -670,6 +702,28 @@ class LTX2TextEncoder(nn.Module):
                 if key.startswith("model.diffusion_model.video_embeddings_connector."):
                     new_key = key.replace("model.diffusion_model.video_embeddings_connector.", "")
                     connector_weights[new_key] = value
+
+            # If connector weights are missing (e.g. quantized-only transformer file),
+            # fall back to base LTX-2 weights for connector extraction.
+            if not connector_weights:
+                try:
+                    from mlx_video.utils import get_model_path
+                    base_path = get_model_path("Lightricks/LTX-2", require_files=False)
+                    base_files = list(Path(base_path).glob("ltx-2-19*.safetensors"))
+                    if base_files:
+                        print("[TextEncoder] Using connector weights from base LTX-2 snapshot")
+                        base_weights = mx.load(str(base_files[0]))
+                        for key, value in base_weights.items():
+                            if key.startswith("model.diffusion_model.video_embeddings_connector."):
+                                new_key = key.replace("model.diffusion_model.video_embeddings_connector.", "")
+                                connector_weights[new_key] = value
+                        if "text_embedding_projection.aggregate_embed.weight" in base_weights:
+                            self.feature_extractor.aggregate_embed.weight = base_weights[
+                                "text_embedding_projection.aggregate_embed.weight"
+                            ]
+                        transformer_weights = base_weights
+                except Exception:
+                    pass
 
             if connector_weights:
                 # Map weight names to our structure
@@ -722,11 +776,34 @@ class LTX2TextEncoder(nn.Module):
 
         # Load tokenizer
         from transformers import AutoTokenizer
-        tokenizer_path = model_path / "tokenizer"
-        if tokenizer_path.exists():
-            self.processor = AutoTokenizer.from_pretrained(str(tokenizer_path), trust_remote_code=True)
-        else:
-            self.processor = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)
+
+        def _has_tokenizer_files(path: Path) -> bool:
+            if not path.exists():
+                return False
+            return (path / "tokenizer.model").exists() or (path / "tokenizer.json").exists()
+
+        tokenizer_path = model_path / "tokenizer" if model_path is not None else None
+        text_enc_path = Path(str(text_encoder_path))
+
+        try:
+            if _has_tokenizer_files(text_enc_path):
+                self.processor = AutoTokenizer.from_pretrained(
+                    str(text_enc_path), trust_remote_code=True
+                )
+            elif tokenizer_path is not None and _has_tokenizer_files(tokenizer_path):
+                self.processor = AutoTokenizer.from_pretrained(
+                    str(tokenizer_path), trust_remote_code=True
+                )
+            else:
+                # Use HF subfolder tokenizer as a stable fallback.
+                self.processor = AutoTokenizer.from_pretrained(
+                    "Lightricks/LTX-2", subfolder="tokenizer", trust_remote_code=True
+                )
+        except Exception:
+            # Final fallback: best-effort attempt with text encoder path.
+            self.processor = AutoTokenizer.from_pretrained(
+                str(text_enc_path), trust_remote_code=True
+            )
         # Set left padding to match official LTX-2 text encoder
         self.processor.padding_side = "left"
 
@@ -879,8 +956,13 @@ class LTX2TextEncoder(nn.Module):
             {"role": "user", "content": f"user prompt: {prompt}"},
         ]
 
-        # Apply chat template
-        formatted = self._apply_chat_template(messages)
+        # Apply chat template (prefer tokenizer-provided template if available)
+        if hasattr(self.processor, "apply_chat_template"):
+            formatted = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            formatted = self._apply_chat_template(messages)
 
         # Use mlx-lm generate with temperature sampling
         mx.random.seed(seed)
@@ -889,7 +971,7 @@ class LTX2TextEncoder(nn.Module):
         inputs = self.processor(
             formatted,
             return_tensors="np",
-            add_special_tokens=False,
+            add_special_tokens=self._enhance_add_special_tokens,
         )
         input_ids = mx.array(inputs["input_ids"])
 

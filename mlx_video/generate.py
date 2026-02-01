@@ -4,6 +4,7 @@ Supports both distilled (two-stage with upsampling) and dev (single-stage with C
 """
 
 import argparse
+import os
 import re
 import math
 import time
@@ -114,7 +115,6 @@ DEFAULT_NEGATIVE_PROMPT = (
     "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
 )
 
-YOLO_ENHANCE_REPO = "msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit"
 
 
 def _slugify_filename(text: str, max_len: int = 80) -> str:
@@ -708,18 +708,27 @@ def load_audio_decoder(model_path: Path, pipeline: PipelineType):
     )
 
     weight_file = model_path / ("ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors")
-    if weight_file.exists():
+    audio_vae_file = model_path / "audio_vae" / "diffusion_pytorch_model.safetensors"
+    raw_weights = None
+    if audio_vae_file.exists():
+        raw_weights = mx.load(str(audio_vae_file))
+    elif weight_file.exists():
         raw_weights = mx.load(str(weight_file))
-        sanitized = sanitize_audio_vae_weights(raw_weights)
-        if sanitized:
-            # strip encoder prefix for decoder
-            dec_weights = {k.replace("decoder.", ""): v for k, v in sanitized.items() if k.startswith("decoder.")}
-            stats = {k: v for k, v in sanitized.items() if k.startswith("per_channel_statistics.")}
-            decoder.load_weights(list(dec_weights.items()), strict=False)
-            if "per_channel_statistics._mean_of_means" in sanitized:
-                decoder.per_channel_statistics._mean_of_means = sanitized["per_channel_statistics._mean_of_means"]
-            if "per_channel_statistics._std_of_means" in sanitized:
-                decoder.per_channel_statistics._std_of_means = sanitized["per_channel_statistics._std_of_means"]
+    else:
+        raise FileNotFoundError(
+            f"Audio VAE weights not found in {model_path}. "
+            "Include audio_vae/diffusion_pytorch_model.safetensors or full base weights in the same repo."
+        )
+
+    sanitized = sanitize_audio_vae_weights(raw_weights)
+    if sanitized:
+        # strip encoder prefix for decoder
+        dec_weights = {k.replace("decoder.", ""): v for k, v in sanitized.items() if k.startswith("decoder.")}
+        decoder.load_weights(list(dec_weights.items()), strict=False)
+        if "per_channel_statistics._mean_of_means" in sanitized:
+            decoder.per_channel_statistics._mean_of_means = sanitized["per_channel_statistics._mean_of_means"]
+        if "per_channel_statistics._std_of_means" in sanitized:
+            decoder.per_channel_statistics._std_of_means = sanitized["per_channel_statistics._std_of_means"]
 
     return decoder
 
@@ -740,11 +749,21 @@ def load_vocoder(model_path: Path, pipeline: PipelineType):
     )
 
     weight_file = model_path / ("ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors")
-    if weight_file.exists():
+    vocoder_file = model_path / "vocoder" / "diffusion_pytorch_model.safetensors"
+    raw_weights = None
+    if vocoder_file.exists():
+        raw_weights = mx.load(str(vocoder_file))
+    elif weight_file.exists():
         raw_weights = mx.load(str(weight_file))
-        sanitized = sanitize_vocoder_weights(raw_weights)
-        if sanitized:
-            vocoder.load_weights(list(sanitized.items()), strict=False)
+    else:
+        raise FileNotFoundError(
+            f"Vocoder weights not found in {model_path}. "
+            "Include vocoder/diffusion_pytorch_model.safetensors or full base weights in the same repo."
+        )
+
+    sanitized = sanitize_vocoder_weights(raw_weights)
+    if sanitized:
+        vocoder.load_weights(list(sanitized.items()), strict=False)
 
     return vocoder
 
@@ -1024,7 +1043,19 @@ def generate_video(
     else:
         model_path = get_model_path(model_repo)
 
-    text_encoder_path = model_path if text_encoder_repo is None else get_model_path(text_encoder_repo)
+    default_text_encoder = os.environ.get(
+        "LTX_TEXT_ENCODER_REPO",
+        "msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit",
+    )
+    if text_encoder_repo is None:
+        # Prefer bundled text_encoder folder if present; otherwise fall back to default repo.
+        if (model_path / "text_encoder").is_dir():
+            text_encoder_path = model_path
+        else:
+            text_encoder_repo = default_text_encoder
+            text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
+    else:
+        text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
 
     # Auto-generate a descriptive output name from the prompt (optional)
     if auto_output_name:
@@ -1036,7 +1067,7 @@ def generate_video(
         try:
             from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
             name_encoder = LTX2TextEncoder()
-            name_model = output_name_model or text_encoder_repo or YOLO_ENHANCE_REPO
+            name_model = output_name_model or text_encoder_repo
             name_encoder.load(model_path=model_path, text_encoder_path=name_model)
             mx.eval(name_encoder.parameters())
             raw_name = name_encoder.enhance_t2v(
@@ -1082,19 +1113,26 @@ def generate_video(
 
     mx.random.seed(seed)
 
-    # Optional prompt enhancement using an alternate model
+    def _resolve_vae_source() -> Path:
+        """Resolve a VAE source path for decoding (no cross-repo fallback)."""
+        # Prefer dedicated VAE weights inside the selected model repo.
+        if (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+            return model_path
+        # Prefer full (non-MLX) weights inside the same repo (contains VAE stats/decoder).
+        base_weight = model_path / weight_file
+        if base_weight.exists():
+            return base_weight
+        # If an explicit checkpoint is provided and isn't the quantized MLX file, use it.
+        if explicit_weight_path and explicit_weight_path.exists():
+            if not explicit_weight_path.name.endswith("-mlx.safetensors"):
+                return explicit_weight_path
+        raise FileNotFoundError(
+            "VAE weights not found in the selected model repo. "
+            "Include either `vae/diffusion_pytorch_model.safetensors` "
+            "or the full `ltx-2-19b-*.safetensors` in the same repo."
+        )
+
     enhanced_with_alt = False
-    if enhance_prompt and enhance_prompt_model:
-        console.print("[bold magenta]✨ Enhancing prompt (YOLO model)[/]")
-        from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
-        enhancer = LTX2TextEncoder()
-        enhancer.load(model_path=model_path, text_encoder_path=enhance_prompt_model)
-        mx.eval(enhancer.parameters())
-        prompt = enhancer.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
-        console.print(f"[dim]Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}[/]")
-        del enhancer
-        mx.clear_cache()
-        enhanced_with_alt = True
 
     # Load text encoder for embeddings
     with console.status("[blue]📝 Loading text encoder...[/]", spinner="dots"):
@@ -1108,7 +1146,7 @@ def generate_video(
     if enhance_prompt and not enhanced_with_alt:
         console.print("[bold magenta]✨ Enhancing prompt[/]")
         prompt = text_encoder.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
-        console.print(f"[dim]Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}[/]")
+        console.print(f"[dim]Enhanced prompt:[/]\n{prompt}")
 
     # Encode prompts
     if is_dev_pipeline:
@@ -1181,6 +1219,16 @@ def generate_video(
                 float_weight_path = model_path / weight_file
                 if not float_weight_path.exists():
                     float_weight_path = weight_file_path
+                if not float_weight_path.exists():
+                    # Fallback: use base LTX-2 float weights for LoRA merge
+                    try:
+                        from mlx_video.utils import get_model_path
+                        base_model_path = get_model_path("Lightricks/LTX-2")
+                        candidate = base_model_path / weight_file
+                        if candidate.exists():
+                            float_weight_path = candidate
+                    except Exception:
+                        pass
                 if not float_weight_path.exists():
                     raise ValueError(
                         f"LoRA on quantized weights requires float weights at {model_path / weight_file}."
@@ -1402,7 +1450,7 @@ def generate_video(
             upsampler = load_upsampler(str(model_path / 'ltx-2-spatial-upscaler-x2-1.0.safetensors'))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = load_vae_decoder(str(weight_file_path), timestep_conditioning=None)
+            vae_decoder = load_vae_decoder(str(_resolve_vae_source()), timestep_conditioning=None)
 
             latents = upsample_latents(latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
             mx.eval(latents)
@@ -1567,7 +1615,7 @@ def generate_video(
         _log_memory("denoise complete", mem_log)
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
-        vae_decoder = load_vae_decoder(str(weight_file_path), timestep_conditioning=None)
+        vae_decoder = load_vae_decoder(str(_resolve_vae_source()), timestep_conditioning=None)
 
     del transformer
     mx.clear_cache()
@@ -1879,19 +1927,9 @@ Examples:
     )
     parser.add_argument("--enhance-prompt", action="store_true", help="Enhance the prompt using Gemma")
     parser.add_argument(
-        "--enhance-prompt-yolo",
-        action="store_true",
-        help=f"Enhance prompt using {YOLO_ENHANCE_REPO}",
-    )
-    parser.add_argument(
         "--auto-output-name",
         action="store_true",
         help="Generate a descriptive output filename from the prompt using Gemma",
-    )
-    parser.add_argument(
-        "--auto-output-name-yolo",
-        action="store_true",
-        help=f"Generate output filename using {YOLO_ENHANCE_REPO}",
     )
     parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens for prompt enhancement")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for prompt enhancement")
@@ -1966,17 +2004,9 @@ Examples:
     if args.gemma_root is not None:
         args.text_encoder_repo = args.gemma_root
 
-    enhance_prompt_model = None
-    if args.enhance_prompt_yolo:
-        args.enhance_prompt = True
-        enhance_prompt_model = YOLO_ENHANCE_REPO
-
     auto_output_name_model = None
-    if args.auto_output_name_yolo:
-        args.auto_output_name = True
-        auto_output_name_model = YOLO_ENHANCE_REPO
-    elif args.auto_output_name:
-        auto_output_name_model = enhance_prompt_model or args.text_encoder_repo or YOLO_ENHANCE_REPO
+    if args.auto_output_name:
+        auto_output_name_model = args.text_encoder_repo
 
     if args.skip_audio and args.audio:
         console.print("[yellow]⚠️  --skip-audio overrides --audio[/]")
@@ -2030,7 +2060,7 @@ Examples:
         save_frames=args.save_frames,
         verbose=args.verbose,
         enhance_prompt=args.enhance_prompt,
-        enhance_prompt_model=enhance_prompt_model,
+        enhance_prompt_model=None,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         image=None,

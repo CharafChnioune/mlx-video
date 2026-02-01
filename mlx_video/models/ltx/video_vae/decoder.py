@@ -531,10 +531,13 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
     # Try to find the weights file
     if model_path.is_file() and model_path.suffix == ".safetensors":
         weights_path = model_path
+    elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+        # Prefer dedicated VAE weights when present
+        weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+    elif (model_path / "ltx-2-19b-dev.safetensors").exists():
+        weights_path = model_path / "ltx-2-19b-dev.safetensors"
     elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
         weights_path = model_path / "ltx-2-19b-distilled.safetensors"
-    elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-        weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
     else:
         raise FileNotFoundError(f"VAE weights not found at {model_path}")
 
