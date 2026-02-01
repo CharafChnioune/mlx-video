@@ -882,6 +882,11 @@ class LTX2TextEncoder(nn.Module):
         return _load_system_prompt("gemma_t2v_system_prompt.txt")
 
     @functools.cached_property
+    def default_t2v_negative_system_prompt(self) -> str:
+        """Load the default T2V negative system prompt."""
+        return _load_system_prompt("gemma_t2v_negative_system_prompt.txt")
+
+    @functools.cached_property
     def default_i2v_system_prompt(self) -> str:
         """Load the default I2V system prompt."""
         return _load_system_prompt("gemma_i2v_system_prompt.txt")
