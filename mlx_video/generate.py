@@ -217,7 +217,10 @@ def ltx2_scheduler(
     Returns:
         Array of sigma values of shape (steps + 1,)
     """
-    tokens = num_tokens if num_tokens is not None else MAX_SHIFT_ANCHOR
+    if num_tokens is None:
+        tokens = MAX_SHIFT_ANCHOR
+    else:
+        tokens = min(num_tokens, MAX_SHIFT_ANCHOR)
     sigmas = np.linspace(1.0, 0.0, steps + 1)
 
     # Compute shift based on token count
@@ -243,8 +246,9 @@ def ltx2_scheduler(
         non_zero_sigmas = sigmas[non_zero_mask]
         one_minus_z = 1.0 - non_zero_sigmas
         scale_factor = one_minus_z[-1] / (1.0 - terminal)
-        stretched = 1.0 - (one_minus_z / scale_factor)
-        sigmas[non_zero_mask] = stretched
+        if np.isfinite(scale_factor) and scale_factor != 0:
+            stretched = 1.0 - (one_minus_z / scale_factor)
+            sigmas[non_zero_mask] = stretched
 
     return mx.array(sigmas, dtype=mx.float32)
 
