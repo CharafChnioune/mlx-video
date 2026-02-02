@@ -580,8 +580,10 @@ def load_vae_decoder(
 
     decoder = LTX2VideoDecoder(timestep_conditioning=timestep_conditioning)
 
+    weights_sanitized = False
     if weights_override is not None:
         weights = dict(weights_override)
+        weights_sanitized = True
     else:
         weights = mx.load(str(weights_path))
         if any(k.startswith("vae_decoder.") for k in weights.keys()):
@@ -590,6 +592,7 @@ def load_vae_decoder(
                 for k, v in weights.items()
                 if k.startswith("vae_decoder.")
             }
+            weights_sanitized = True
     if _debug_enabled():
         total = len(weights)
         has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
@@ -644,7 +647,7 @@ def load_vae_decoder(
         new_key = key[len(prefix):]
 
         # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
-        if ".conv.weight" in key and value.ndim == 5:
+        if not weights_sanitized and ".conv.weight" in key and value.ndim == 5:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
         if ".conv.bias" in key:
             pass  # bias doesn't need transpose

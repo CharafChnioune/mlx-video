@@ -118,8 +118,10 @@ def load_vae_encoder(model_path: str, weights_override: Optional[dict] = None) -
     )
 
     # Load weights
+    weights_sanitized = False
     if weights_override is not None:
         weights = dict(weights_override)
+        weights_sanitized = True
     else:
         weights = mx.load(str(weights_path))
         if any(k.startswith("vae_encoder.") for k in weights.keys()):
@@ -128,6 +130,7 @@ def load_vae_encoder(model_path: str, weights_override: Optional[dict] = None) -
                 for k, v in weights.items()
                 if k.startswith("vae_encoder.")
             }
+            weights_sanitized = True
 
     # Determine prefix based on weight keys
     has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
@@ -170,7 +173,7 @@ def load_vae_encoder(model_path: str, weights_override: Optional[dict] = None) -
         new_key = key[len(prefix):]
 
         # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
-        if ".weight" in key and value.ndim == 5:
+        if not weights_sanitized and ".weight" in key and value.ndim == 5:
             value = mx.transpose(value, (0, 2, 3, 4, 1))
 
         encoder_weights[new_key] = value
