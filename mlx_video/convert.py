@@ -25,7 +25,7 @@ def get_model_path(
     Returns:
         Path to model directory
     """
-    model_path = Path(path_or_hf_repo)
+    model_path = Path(path_or_hf_repo).expanduser()
 
     if model_path.exists():
         return model_path
@@ -61,11 +61,24 @@ def load_safetensors(path: Path) -> Dict[str, mx.array]:
         # Single file - use mx.load directly (handles bfloat16)
         return mx.load(str(path))
     else:
-        # Directory - load all safetensors files
+        # Directory - load only the main model file (not quantized versions)
+        # Priority: distilled > dev (skip fp4/fp8/lora variants)
+        main_files = [
+            path / "ltx-2-19b-distilled.safetensors",
+            path / "ltx-2-19b-dev.safetensors",
+        ]
+        for main_file in main_files:
+            if main_file.exists():
+                print(f"  Loading from {main_file.name}")
+                return mx.load(str(main_file))
+
+        # Fallback: load first non-quantized safetensors file
         safetensor_files = list(path.glob("*.safetensors"))
         for sf_path in safetensor_files:
-            file_weights = mx.load(str(sf_path))
-            weights.update(file_weights)
+            if any(x in sf_path.name for x in ["-fp4", "-fp8", "-lora"]):
+                continue
+            print(f"  Loading from {sf_path.name}")
+            return mx.load(str(sf_path))
 
     return weights
 
@@ -251,8 +264,13 @@ def sanitize_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         if "position_ids" in key:
             continue
 
+        # Allow top-level VAE stats when loading from dedicated VAE files
+        if key in {"latents_mean", "latents_std"}:
+            sanitized[key] = value
+            continue
+
         # Only process VAE decoder weights (skip audio_vae, etc.)
-        if not key.startswith("vae."):
+        if not key.startswith("vae.") and not key.startswith("decoder."):
             continue
 
         # Handle per-channel statistics key mapping
@@ -270,6 +288,8 @@ def sanitize_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         elif key.startswith("vae.decoder."):
             # Strip the vae.decoder. prefix for decoder weights
             new_key = key.replace("vae.decoder.", "")
+        elif key.startswith("decoder."):
+            new_key = key.replace("decoder.", "")
         else:
             # Skip other vae.* keys that are not decoder weights
             continue
@@ -317,7 +337,7 @@ def sanitize_vae_encoder_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.a
             continue
 
         # Only process VAE encoder weights
-        if not key.startswith("vae."):
+        if not key.startswith("vae.") and not key.startswith("encoder."):
             continue
 
         # Handle per-channel statistics key mapping
@@ -332,6 +352,8 @@ def sanitize_vae_encoder_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.a
         elif key.startswith("vae.encoder."):
             # Strip the vae.encoder. prefix for encoder weights
             new_key = key.replace("vae.encoder.", "")
+        elif key.startswith("encoder."):
+            new_key = key.replace("encoder.", "")
         else:
             # Skip other vae.* keys that are not encoder weights
             continue
@@ -585,6 +607,8 @@ def convert(
     report_layers: bool = False,
     pipeline: str = "dev",
     loras: Optional[list[tuple[str, float]]] = None,
+    unified: bool = False,
+    include_audio: bool = True,
 ) -> Path:
     """Convert HuggingFace model to MLX format.
 
@@ -598,6 +622,8 @@ def convert(
         quantize_scope: Quantization scope ("attn1" or "all")
         report_layers: Whether to write a layer report JSON
         loras: Optional list of (path, strength) LoRA weights to merge before quantization
+        unified: When True, also emit a unified model.safetensors bundle
+        include_audio: When True, include audio VAE/vocoder weights in unified bundle
 
     Returns:
         Path to converted model
@@ -634,6 +660,7 @@ def convert(
     weights = sanitize_transformer_weights(raw_weights)
 
     # Convert dtype if specified
+    target_dtype = None
     if dtype is not None:
         dtype_map = {
             "float16": mx.float16,
@@ -723,6 +750,66 @@ def convert(
             f"bias/zero tensors: {bias_tensors}"
         )
 
+    unified_weights: Optional[Dict[str, mx.array]] = None
+    if unified:
+        print("Building unified MLX weights...")
+        unified_weights = {}
+        # Transformer weights
+        for key, value in weights.items():
+            unified_weights[f"transformer.{key}"] = value
+
+        # Video VAE decoder + encoder weights
+        try:
+            vae_raw = load_vae_weights(model_path)
+            vae_decoder_weights = sanitize_vae_weights(vae_raw)
+            for key, value in vae_decoder_weights.items():
+                unified_weights[f"vae_decoder.{key}"] = value
+            vae_encoder_weights = sanitize_vae_encoder_weights(vae_raw)
+            for key, value in vae_encoder_weights.items():
+                unified_weights[f"vae_encoder.{key}"] = value
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Unified export missing VAE weights: {exc}") from exc
+
+        if include_audio:
+            try:
+                audio_raw = load_audio_vae_weights(model_path)
+                audio_weights = sanitize_audio_vae_weights(audio_raw)
+                for key, value in audio_weights.items():
+                    unified_weights[f"audio_vae.{key}"] = value
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"Unified export missing audio VAE weights: {exc}. "
+                    "Use --include-audio False to export video-only."
+                ) from exc
+
+            try:
+                vocoder_raw = load_vocoder_weights(model_path)
+                vocoder_weights = sanitize_vocoder_weights(vocoder_raw)
+                for key, value in vocoder_weights.items():
+                    unified_weights[f"vocoder.{key}"] = value
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"Unified export missing vocoder weights: {exc}. "
+                    "Use --include-audio False to export video-only."
+                ) from exc
+
+        # Text encoder projection + connector weights
+        for key, value in connector_weights.items():
+            if key.startswith("text_embedding_projection."):
+                unified_weights[key] = value
+            elif key.startswith("model.diffusion_model."):
+                unified_weights[f"connector.{key.replace('model.diffusion_model.', '')}"] = value
+            else:
+                unified_weights[f"connector.{key}"] = value
+
+        if target_dtype is not None:
+            unified_weights = {
+                k: v.astype(target_dtype)
+                if v.dtype in [mx.float32, mx.float16, mx.bfloat16]
+                else v
+                for k, v in unified_weights.items()
+            }
+
     # Create output directory
     output_path = Path(mlx_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -731,6 +818,11 @@ def convert(
     out_name = f"ltx-2-19b-{pipeline}-mlx.safetensors"
     print(f"Saving weights to {output_path / out_name}...")
     mx.save_safetensors(str(output_path / out_name), weights)
+
+    if unified_weights is not None:
+        unified_path = output_path / "model.safetensors"
+        print(f"Saving unified weights to {unified_path}...")
+        mx.save_safetensors(str(unified_path), unified_weights)
 
     # Save text connector weights (if available)
     if connector_weights:
@@ -846,7 +938,7 @@ def load_model(
     return model
 
 
-if __name__ == "__main__":
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Convert LTX-2 model to MLX format")
@@ -918,6 +1010,16 @@ if __name__ == "__main__":
         metavar=("PATH", "STRENGTH"),
         help="LoRA weights to merge before quantization (can be used multiple times): --lora path 0.8",
     )
+    parser.add_argument(
+        "--unified",
+        action="store_true",
+        help="Also emit a unified model.safetensors bundle (transformer+VAE+audio).",
+    )
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Exclude audio VAE/vocoder weights from unified bundle.",
+    )
 
     args = parser.parse_args()
 
@@ -933,4 +1035,10 @@ if __name__ == "__main__":
         report_layers=args.report_layers,
         pipeline=args.pipeline,
         loras=args.lora,
+        unified=args.unified,
+        include_audio=not args.no_audio,
     )
+
+
+if __name__ == "__main__":
+    main()

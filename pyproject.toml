@@ -43,6 +43,7 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 
 [project.scripts]
 "mlx_video.generate" = "mlx_video.generate:main"
+"mlx_video.convert" = "mlx_video.convert:main"
 "ltx_trainer.train" = "ltx_trainer.scripts.train:app"
 "mlx_video.train" = "mlx_video.mlx_trainer.trainer:main"
 "mlx_video.precompute" = "mlx_video.mlx_trainer.precompute:main"

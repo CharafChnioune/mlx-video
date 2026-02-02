@@ -521,7 +521,11 @@ class LTX2VideoDecoder(nn.Module):
         )
 
 
-def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = None) -> LTX2VideoDecoder:
+def load_vae_decoder(
+    model_path: str,
+    timestep_conditioning: Optional[bool] = None,
+    weights_override: Optional[dict] = None,
+) -> LTX2VideoDecoder:
     from pathlib import Path
     import json
     import os
@@ -536,42 +540,56 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
 
     model_path = Path(model_path)
 
-    # Try to find the weights file
-    if model_path.is_file() and model_path.suffix == ".safetensors":
-        weights_path = model_path
-    elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-        # Prefer dedicated VAE weights when present
-        weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
-    elif (model_path / "ltx-2-19b-dev.safetensors").exists():
-        weights_path = model_path / "ltx-2-19b-dev.safetensors"
-    elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
-        weights_path = model_path / "ltx-2-19b-distilled.safetensors"
+    weights_path = None
+    if weights_override is None:
+        # Try to find the weights file
+        if model_path.is_file() and model_path.suffix == ".safetensors":
+            weights_path = model_path
+        elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+            # Prefer dedicated VAE weights when present
+            weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+        elif (model_path / "ltx-2-19b-dev.safetensors").exists():
+            weights_path = model_path / "ltx-2-19b-dev.safetensors"
+        elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
+            weights_path = model_path / "ltx-2-19b-distilled.safetensors"
+        else:
+            raise FileNotFoundError(f"VAE weights not found at {model_path}")
+
+        print(f"Loading VAE decoder from {weights_path}...")
+        if _debug_enabled():
+            _debug_log(f"weights_path={weights_path} size={weights_path.stat().st_size if weights_path.exists() else 'missing'}")
+
+        # Read config from safetensors metadata to auto-detect timestep_conditioning
+        if timestep_conditioning is None:
+            try:
+                with safe_open(str(weights_path), framework="numpy") as f:
+                    metadata = f.metadata()
+                    if metadata and "config" in metadata:
+                        configs = json.loads(metadata["config"])
+                        vae_config = configs.get("vae", {})
+                        timestep_conditioning = vae_config.get("timestep_conditioning", False)
+                        print(f"  Auto-detected timestep_conditioning={timestep_conditioning} from weights")
+                    else:
+                        timestep_conditioning = False
+            except Exception as e:
+                print(f"  Could not read config from metadata: {e}, defaulting to timestep_conditioning=False")
+                timestep_conditioning = False
     else:
-        raise FileNotFoundError(f"VAE weights not found at {model_path}")
-
-    print(f"Loading VAE decoder from {weights_path}...")
-    if _debug_enabled():
-        _debug_log(f"weights_path={weights_path} size={weights_path.stat().st_size if weights_path.exists() else 'missing'}")
-
-    # Read config from safetensors metadata to auto-detect timestep_conditioning
-    if timestep_conditioning is None:
-        try:
-            with safe_open(str(weights_path), framework="numpy") as f:
-                metadata = f.metadata()
-                if metadata and "config" in metadata:
-                    configs = json.loads(metadata["config"])
-                    vae_config = configs.get("vae", {})
-                    timestep_conditioning = vae_config.get("timestep_conditioning", False)
-                    print(f"  Auto-detected timestep_conditioning={timestep_conditioning} from weights")
-                else:
-                    timestep_conditioning = False
-        except Exception as e:
-            print(f"  Could not read config from metadata: {e}, defaulting to timestep_conditioning=False")
+        if timestep_conditioning is None:
             timestep_conditioning = False
 
     decoder = LTX2VideoDecoder(timestep_conditioning=timestep_conditioning)
 
-    weights = mx.load(str(weights_path))
+    if weights_override is not None:
+        weights = dict(weights_override)
+    else:
+        weights = mx.load(str(weights_path))
+        if any(k.startswith("vae_decoder.") for k in weights.keys()):
+            weights = {
+                k[len("vae_decoder."):]: v
+                for k, v in weights.items()
+                if k.startswith("vae_decoder.")
+            }
     if _debug_enabled():
         total = len(weights)
         has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
@@ -602,6 +620,18 @@ def load_vae_decoder(model_path: str, timestep_conditioning: Optional[bool] = No
         print(f"  Loaded latent mean: shape {decoder.latents_mean.shape}")
     if std_key in weights:
         decoder.latents_std = weights[std_key]
+        print(f"  Loaded latent std: shape {decoder.latents_std.shape}")
+    if "per_channel_statistics.mean" in weights:
+        decoder.latents_mean = weights["per_channel_statistics.mean"]
+        print(f"  Loaded latent mean: shape {decoder.latents_mean.shape}")
+    if "per_channel_statistics.std" in weights:
+        decoder.latents_std = weights["per_channel_statistics.std"]
+        print(f"  Loaded latent std: shape {decoder.latents_std.shape}")
+    if "latents_mean" in weights:
+        decoder.latents_mean = weights["latents_mean"]
+        print(f"  Loaded latent mean: shape {decoder.latents_mean.shape}")
+    if "latents_std" in weights:
+        decoder.latents_std = weights["latents_std"]
         print(f"  Loaded latent std: shape {decoder.latents_std.shape}")
 
     # Build decoder weights dict with key remapping

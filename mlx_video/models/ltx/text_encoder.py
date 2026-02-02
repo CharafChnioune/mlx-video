@@ -689,13 +689,25 @@ class LTX2TextEncoder(nn.Module):
 
         self.language_model = LanguageModel.from_pretrained(text_encoder_path)
 
-        # Load connector weights (prefer small connector file if present)
+        # Load connector weights (prefer unified bundle or small connector file if present)
         transformer_weights = {}
+        unified_path = model_path / "model.safetensors"
+        if unified_path.exists():
+            try:
+                unified_weights = mx.load(str(unified_path))
+                if any(k.startswith("connector.") for k in unified_weights) or any(
+                    k.startswith("text_embedding_projection.") for k in unified_weights
+                ):
+                    print(f"[TextEncoder] Using connector weights from {unified_path}")
+                    transformer_weights = unified_weights
+            except Exception:
+                transformer_weights = {}
+
         connector_file = model_path / "connectors" / "ltx_text_connectors.safetensors"
-        if connector_file.exists():
+        if not transformer_weights and connector_file.exists():
             print(f"[TextEncoder] Using connector weights from {connector_file}")
             transformer_weights = mx.load(str(connector_file))
-        else:
+        if not transformer_weights:
             transformer_files = list(model_path.glob("ltx-2-19*.safetensors"))
             if transformer_files:
                 transformer_weights = mx.load(str(transformer_files[0]))
@@ -715,6 +727,9 @@ class LTX2TextEncoder(nn.Module):
             for key, value in transformer_weights.items():
                 if key.startswith("model.diffusion_model.video_embeddings_connector."):
                     new_key = key.replace("model.diffusion_model.video_embeddings_connector.", "")
+                    connector_weights[new_key] = value
+                elif key.startswith("connector.video_embeddings_connector."):
+                    new_key = key.replace("connector.video_embeddings_connector.", "")
                     connector_weights[new_key] = value
 
             # If connector weights are missing (e.g. quantized-only transformer file),
@@ -767,6 +782,9 @@ class LTX2TextEncoder(nn.Module):
             for key, value in transformer_weights.items():
                 if key.startswith("model.diffusion_model.audio_embeddings_connector."):
                     new_key = key.replace("model.diffusion_model.audio_embeddings_connector.", "")
+                    audio_connector_weights[new_key] = value
+                elif key.startswith("connector.audio_embeddings_connector."):
+                    new_key = key.replace("connector.audio_embeddings_connector.", "")
                     audio_connector_weights[new_key] = value
 
             if audio_connector_weights:

@@ -15,7 +15,7 @@ import mlx.nn as nn
 from mlx_video.models.ltx.video_vae.video_vae import VideoEncoder, LogVarianceType, NormLayerType, PaddingModeType
 
 
-def load_vae_encoder(model_path: str) -> VideoEncoder:
+def load_vae_encoder(model_path: str, weights_override: Optional[dict] = None) -> VideoEncoder:
     """Load VAE encoder from safetensors file.
 
     Args:
@@ -28,19 +28,23 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
 
     model_path = Path(model_path)
 
-    # Try to find the weights file
-    if model_path.is_file() and model_path.suffix == ".safetensors":
-        weights_path = model_path
-    elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-        weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
-    elif (model_path / "ltx-2-19b-dev.safetensors").exists():
-        weights_path = model_path / "ltx-2-19b-dev.safetensors"
-    elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
-        weights_path = model_path / "ltx-2-19b-distilled.safetensors"
-    else:
-        raise FileNotFoundError(f"VAE weights not found at {model_path}")
+    weights_path = None
+    if weights_override is None:
+        # Try to find the weights file
+        if model_path.is_file() and model_path.suffix == ".safetensors":
+            weights_path = model_path
+        elif (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
+            weights_path = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+        elif (model_path / "ltx-2-19b-dev.safetensors").exists():
+            weights_path = model_path / "ltx-2-19b-dev.safetensors"
+        elif (model_path / "ltx-2-19b-distilled.safetensors").exists():
+            weights_path = model_path / "ltx-2-19b-distilled.safetensors"
+        else:
+            raise FileNotFoundError(f"VAE weights not found at {model_path}")
 
-    print(f"Loading VAE encoder from {weights_path}...")
+        print(f"Loading VAE encoder from {weights_path}...")
+    else:
+        print("Loading VAE encoder from unified weights...")
 
     # Read config from safetensors metadata
     encoder_blocks = []
@@ -48,39 +52,45 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
     latent_log_var = LogVarianceType.UNIFORM
     patch_size = 4
 
-    try:
-        with safe_open(str(weights_path), framework="numpy") as f:
-            metadata = f.metadata()
-            if metadata and "config" in metadata:
-                configs = json.loads(metadata["config"])
-                vae_config = configs.get("vae", {})
+    if weights_path is not None:
+        try:
+            with safe_open(str(weights_path), framework="numpy") as f:
+                metadata = f.metadata()
+                if metadata and "config" in metadata:
+                    configs = json.loads(metadata["config"])
+                    vae_config = configs.get("vae", {})
 
-                # Parse encoder blocks
-                raw_blocks = vae_config.get("encoder_blocks", [])
-                for block in raw_blocks:
-                    if isinstance(block, list) and len(block) == 2:
-                        name, params = block
-                        encoder_blocks.append((name, params))
+                    # Parse encoder blocks
+                    raw_blocks = vae_config.get("encoder_blocks", [])
+                    for block in raw_blocks:
+                        if isinstance(block, list) and len(block) == 2:
+                            name, params = block
+                            encoder_blocks.append((name, params))
 
-                # Parse other config
-                norm_str = vae_config.get("norm_layer", "pixel_norm")
-                norm_layer = NormLayerType.PIXEL_NORM if norm_str == "pixel_norm" else NormLayerType.GROUP_NORM
+                    # Parse other config
+                    norm_str = vae_config.get("norm_layer", "pixel_norm")
+                    norm_layer = NormLayerType.PIXEL_NORM if norm_str == "pixel_norm" else NormLayerType.GROUP_NORM
 
-                var_str = vae_config.get("latent_log_var", "uniform")
-                if var_str == "uniform":
-                    latent_log_var = LogVarianceType.UNIFORM
-                elif var_str == "per_channel":
-                    latent_log_var = LogVarianceType.PER_CHANNEL
-                elif var_str == "constant":
-                    latent_log_var = LogVarianceType.CONSTANT
-                else:
-                    latent_log_var = LogVarianceType.NONE
+                    var_str = vae_config.get("latent_log_var", "uniform")
+                    if var_str == "uniform":
+                        latent_log_var = LogVarianceType.UNIFORM
+                    elif var_str == "per_channel":
+                        latent_log_var = LogVarianceType.PER_CHANNEL
+                    elif var_str == "constant":
+                        latent_log_var = LogVarianceType.CONSTANT
+                    else:
+                        latent_log_var = LogVarianceType.NONE
 
-                patch_size = vae_config.get("patch_size", 4)
+                    patch_size = vae_config.get("patch_size", 4)
 
-                print(f"  Loaded config: {len(encoder_blocks)} encoder blocks, norm={norm_str}, patch_size={patch_size}")
-    except Exception as e:
-        print(f"  Could not read config from metadata: {e}")
+                    print(
+                        f"  Loaded config: {len(encoder_blocks)} encoder blocks, norm={norm_str}, patch_size={patch_size}"
+                    )
+        except Exception as e:
+            print(f"  Could not read config from metadata: {e}")
+            encoder_blocks = []
+
+    if not encoder_blocks:
         # Use default config
         encoder_blocks = [
             ("res_x", {"num_layers": 4}),
@@ -108,17 +118,30 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
     )
 
     # Load weights
-    weights = mx.load(str(weights_path))
+    if weights_override is not None:
+        weights = dict(weights_override)
+    else:
+        weights = mx.load(str(weights_path))
+        if any(k.startswith("vae_encoder.") for k in weights.keys()):
+            weights = {
+                k[len("vae_encoder."):]: v
+                for k, v in weights.items()
+                if k.startswith("vae_encoder.")
+            }
 
     # Determine prefix based on weight keys
     has_vae_prefix = any(k.startswith("vae.") for k in weights.keys())
+    has_encoder_prefix = any(k.startswith("encoder.") for k in weights.keys())
 
     if has_vae_prefix:
         prefix = "vae.encoder."
         stats_prefix = "vae.per_channel_statistics."
-    else:
+    elif has_encoder_prefix:
         prefix = "encoder."
         stats_prefix = "per_channel_statistics."
+    else:
+        prefix = ""
+        stats_prefix = ""
 
     # Load per-channel statistics for normalization
     mean_key = f"{stats_prefix}mean-of-means"
@@ -130,6 +153,12 @@ def load_vae_encoder(model_path: str) -> VideoEncoder:
     if std_key in weights:
         encoder.per_channel_statistics.std = weights[std_key]
         print(f"  Loaded latent std: shape {weights[std_key].shape}")
+    if "per_channel_statistics.mean" in weights:
+        encoder.per_channel_statistics.mean = weights["per_channel_statistics.mean"]
+        print(f"  Loaded latent mean: shape {weights['per_channel_statistics.mean'].shape}")
+    if "per_channel_statistics.std" in weights:
+        encoder.per_channel_statistics.std = weights["per_channel_statistics.std"]
+        print(f"  Loaded latent std: shape {weights['per_channel_statistics.std'].shape}")
 
     # Build encoder weights dict with key remapping
     encoder_weights = {}

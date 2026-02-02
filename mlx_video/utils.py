@@ -29,6 +29,8 @@ def _required_model_files() -> list[str]:
 
 
 def _has_required_files(path: Path) -> bool:
+    if (path / "model.safetensors").exists():
+        return True
     return all((path / rel).exists() for rel in _required_model_files())
 
 def _needs_connectors(repo_id: str) -> bool:
@@ -46,7 +48,7 @@ def get_model_path(model_repo: str, require_files: bool = True):
         Path to the model directory.
     """
     alias = MODEL_REPO_ALIASES.get(model_repo, model_repo)
-    local_path = Path(alias)
+    local_path = Path(alias).expanduser()
     if local_path.exists() and local_path.is_dir():
         return local_path
     

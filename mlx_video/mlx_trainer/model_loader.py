@@ -44,20 +44,57 @@ def load_transformer(checkpoint_path: str | Path, config: Optional[LTXModelConfi
             use_middle_indices_grid=True,
             timestep_scale_multiplier=1000,
         )
-    return LTXModel.from_pretrained([ckpt], config=config, strict=False)
+    unified_path = ckpt if ckpt.is_file() else (ckpt / "model.safetensors")
+    weights_override = None
+    model_path = ckpt
+    if unified_path.exists():
+        unified_weights = mx.load(str(unified_path))
+        transformer_weights = {
+            k[len("transformer."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("transformer.")
+        }
+        if transformer_weights:
+            weights_override = transformer_weights
+            model_path = unified_path
+    return LTXModel.from_pretrained([model_path], config=config, strict=False, weights_override=weights_override)
 
 
 def load_video_vae_encoder(checkpoint_path: str | Path):
-    return load_vae_encoder(str(_resolve_path(checkpoint_path)))
+    ckpt = _resolve_path(checkpoint_path)
+    unified_path = ckpt if ckpt.is_file() else (ckpt / "model.safetensors")
+    weights_override = None
+    if unified_path.exists():
+        unified_weights = mx.load(str(unified_path))
+        weights_override = {
+            k[len("vae_encoder."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("vae_encoder.")
+        } or None
+    return load_vae_encoder(str(ckpt), weights_override=weights_override)
 
 
 def load_video_vae_decoder(checkpoint_path: str | Path):
-    return load_vae_decoder(str(_resolve_path(checkpoint_path)), timestep_conditioning=None)
+    ckpt = _resolve_path(checkpoint_path)
+    unified_path = ckpt if ckpt.is_file() else (ckpt / "model.safetensors")
+    weights_override = None
+    if unified_path.exists():
+        unified_weights = mx.load(str(unified_path))
+        weights_override = {
+            k[len("vae_decoder."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("vae_decoder.")
+        } or None
+    return load_vae_decoder(str(ckpt), timestep_conditioning=None, weights_override=weights_override)
 
 
 def load_audio_vae_decoder(checkpoint_path: str | Path):
     model_path = _resolve_path(checkpoint_path)
     root = model_path.parent if model_path.is_file() else model_path
+    unified_path = model_path if model_path.is_file() else (model_path / "model.safetensors")
+    unified_weights = None
+    if unified_path.exists():
+        unified_weights = mx.load(str(unified_path))
     cfg_path = root / "audio_vae" / "config.json"
     cfg = {}
     if cfg_path.exists():
@@ -96,8 +133,19 @@ def load_audio_vae_decoder(checkpoint_path: str | Path):
         mel_bins=mel_bins,
     )
 
-    weights = load_audio_vae_weights(root)
-    sanitized = sanitize_audio_vae_weights(weights)
+    if unified_weights:
+        weights = {
+            k[len("audio_vae."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("audio_vae.")
+        }
+        if weights:
+            sanitized = weights
+        else:
+            unified_weights = None
+    if not unified_weights:
+        weights = load_audio_vae_weights(root)
+        sanitized = sanitize_audio_vae_weights(weights)
     dec_weights = {k.replace("decoder.", ""): v for k, v in sanitized.items() if k.startswith("decoder.")}
     if dec_weights:
         decoder.load_weights(list(dec_weights.items()), strict=False)
@@ -111,6 +159,10 @@ def load_audio_vae_decoder(checkpoint_path: str | Path):
 def load_vocoder(checkpoint_path: str | Path):
     model_path = _resolve_path(checkpoint_path)
     root = model_path.parent if model_path.is_file() else model_path
+    unified_path = model_path if model_path.is_file() else (model_path / "model.safetensors")
+    unified_weights = None
+    if unified_path.exists():
+        unified_weights = mx.load(str(unified_path))
     cfg_path = root / "vocoder" / "config.json"
     cfg = {}
     if cfg_path.exists():
@@ -126,8 +178,19 @@ def load_vocoder(checkpoint_path: str | Path):
         stereo=True,
         output_sample_rate=cfg.get("output_sampling_rate", 24000),
     )
-    weights = load_vocoder_weights(root)
-    sanitized = sanitize_vocoder_weights(weights)
+    if unified_weights:
+        weights = {
+            k[len("vocoder."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("vocoder.")
+        }
+        if weights:
+            sanitized = weights
+        else:
+            unified_weights = None
+    if not unified_weights:
+        weights = load_vocoder_weights(root)
+        sanitized = sanitize_vocoder_weights(weights)
     if sanitized:
         vocoder.load_weights(list(sanitized.items()), strict=False)
     return vocoder
@@ -135,9 +198,10 @@ def load_vocoder(checkpoint_path: str | Path):
 
 def load_text_encoder(checkpoint_path: str | Path, text_encoder_path: str | Path) -> LTX2TextEncoder:
     model_path = _resolve_path(checkpoint_path)
+    root = model_path.parent if model_path.is_file() else model_path
     text_encoder_root = _resolve_path(text_encoder_path)
     encoder = LTX2TextEncoder()
-    encoder.load(model_path=model_path, text_encoder_path=text_encoder_root)
+    encoder.load(model_path=root, text_encoder_path=text_encoder_root)
     mx.eval(encoder.parameters())
     return encoder
 

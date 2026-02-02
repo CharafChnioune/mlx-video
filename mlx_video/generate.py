@@ -750,7 +750,7 @@ def denoise_dev_av(
 # Audio Loading and Processing
 # =============================================================================
 
-def load_audio_decoder(model_path: Path, pipeline: PipelineType):
+def load_audio_decoder(model_path: Path, pipeline: PipelineType, unified_weights: Optional[dict] = None):
     """Load audio VAE decoder."""
     from mlx_video.models.ltx.audio_vae import AudioDecoder, CausalityAxis, NormType
     from mlx_video.convert import sanitize_audio_vae_weights
@@ -769,20 +769,34 @@ def load_audio_decoder(model_path: Path, pipeline: PipelineType):
         mid_block_add_attention=False,  # Config says no attention in mid block
     )
 
-    weight_file = model_path / ("ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors")
-    audio_vae_file = model_path / "audio_vae" / "diffusion_pytorch_model.safetensors"
     raw_weights = None
-    if audio_vae_file.exists():
-        raw_weights = mx.load(str(audio_vae_file))
-    elif weight_file.exists():
-        raw_weights = mx.load(str(weight_file))
-    else:
-        raise FileNotFoundError(
-            f"Audio VAE weights not found in {model_path}. "
-            "Include audio_vae/diffusion_pytorch_model.safetensors or full base weights in the same repo."
-        )
+    from_unified = False
+    if unified_weights is not None:
+        unified_audio = {
+            k[len("audio_vae."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("audio_vae.")
+        }
+        if unified_audio:
+            raw_weights = unified_audio
+            from_unified = True
 
-    sanitized = sanitize_audio_vae_weights(raw_weights)
+    if raw_weights is None:
+        weight_file = model_path / (
+            "ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors"
+        )
+        audio_vae_file = model_path / "audio_vae" / "diffusion_pytorch_model.safetensors"
+        if audio_vae_file.exists():
+            raw_weights = mx.load(str(audio_vae_file))
+        elif weight_file.exists():
+            raw_weights = mx.load(str(weight_file))
+        else:
+            raise FileNotFoundError(
+                f"Audio VAE weights not found in {model_path}. "
+                "Include audio_vae/diffusion_pytorch_model.safetensors or full base weights in the same repo."
+            )
+
+    sanitized = raw_weights if from_unified else sanitize_audio_vae_weights(raw_weights)
     if sanitized:
         # strip encoder prefix for decoder
         dec_weights = {k.replace("decoder.", ""): v for k, v in sanitized.items() if k.startswith("decoder.")}
@@ -795,7 +809,7 @@ def load_audio_decoder(model_path: Path, pipeline: PipelineType):
     return decoder
 
 
-def load_vocoder(model_path: Path, pipeline: PipelineType):
+def load_vocoder(model_path: Path, pipeline: PipelineType, unified_weights: Optional[dict] = None):
     """Load vocoder for mel to waveform conversion."""
     from mlx_video.models.ltx.audio_vae import Vocoder
     from mlx_video.convert import sanitize_vocoder_weights
@@ -810,20 +824,34 @@ def load_vocoder(model_path: Path, pipeline: PipelineType):
         output_sample_rate=AUDIO_SAMPLE_RATE,
     )
 
-    weight_file = model_path / ("ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors")
-    vocoder_file = model_path / "vocoder" / "diffusion_pytorch_model.safetensors"
     raw_weights = None
-    if vocoder_file.exists():
-        raw_weights = mx.load(str(vocoder_file))
-    elif weight_file.exists():
-        raw_weights = mx.load(str(weight_file))
-    else:
-        raise FileNotFoundError(
-            f"Vocoder weights not found in {model_path}. "
-            "Include vocoder/diffusion_pytorch_model.safetensors or full base weights in the same repo."
-        )
+    from_unified = False
+    if unified_weights is not None:
+        unified_vocoder = {
+            k[len("vocoder."):]: v
+            for k, v in unified_weights.items()
+            if k.startswith("vocoder.")
+        }
+        if unified_vocoder:
+            raw_weights = unified_vocoder
+            from_unified = True
 
-    sanitized = sanitize_vocoder_weights(raw_weights)
+    if raw_weights is None:
+        weight_file = model_path / (
+            "ltx-2-19b-dev.safetensors" if pipeline == PipelineType.DEV else "ltx-2-19b-distilled.safetensors"
+        )
+        vocoder_file = model_path / "vocoder" / "diffusion_pytorch_model.safetensors"
+        if vocoder_file.exists():
+            raw_weights = mx.load(str(vocoder_file))
+        elif weight_file.exists():
+            raw_weights = mx.load(str(weight_file))
+        else:
+            raise FileNotFoundError(
+                f"Vocoder weights not found in {model_path}. "
+                "Include vocoder/diffusion_pytorch_model.safetensors or full base weights in the same repo."
+            )
+
+    sanitized = raw_weights if from_unified else sanitize_vocoder_weights(raw_weights)
     if sanitized:
         vocoder.load_weights(list(sanitized.items()), strict=False)
 
@@ -1178,6 +1206,27 @@ def generate_video(
     if weight_file_path != transformer_weight_path:
         _debug_weights_summary("base_weights", weight_file_path)
 
+    unified_weights = None
+    unified_path = model_path / "model.safetensors"
+    if unified_path.exists() and os.environ.get("LTX_DISABLE_UNIFIED") != "1":
+        try:
+            unified_weights = mx.load(str(unified_path))
+            if not any(k.startswith("transformer.") for k in unified_weights):
+                unified_weights = None
+        except Exception as exc:
+            _debug_log(f"unified load error: {exc}")
+            unified_weights = None
+
+    def _unified_subset(prefix: str) -> Optional[dict]:
+        if unified_weights is None:
+            return None
+        subset = {
+            k[len(prefix):]: v
+            for k, v in unified_weights.items()
+            if k.startswith(prefix)
+        }
+        return subset or None
+
     # Calculate latent dimensions
     if is_distilled_pipeline:
         stage1_h, stage1_w = height // 2 // 32, width // 2 // 32
@@ -1199,6 +1248,9 @@ def generate_video(
 
     def _resolve_vae_source() -> Path:
         """Resolve a VAE source path for decoding (no cross-repo fallback)."""
+        if _unified_subset("vae_decoder.") is not None:
+            _debug_log(f"vae_source=unified {unified_path}")
+            return unified_path
         # Prefer full (non-MLX) weights inside the same repo (contains VAE stats/decoder).
         base_weight = model_path / weight_file
         if base_weight.exists():
@@ -1336,9 +1388,18 @@ def generate_video(
     def _load_transformer_with_loras(lora_list: Optional[list[tuple[str, float]]]):
         transformer_local = None
         weights_override = None
+        transformer_weights = None
+        if unified_weights is not None:
+            transformer_weights = {
+                k[len("transformer."):]: v
+                for k, v in unified_weights.items()
+                if k.startswith("transformer.")
+            }
+            if not transformer_weights:
+                transformer_weights = None
         if lora_list:
             from mlx_video.lora import LoraSpec, apply_lora_to_weights, has_quantized_weights
-            raw_weights = mx.load(str(transformer_weight_path))
+            raw_weights = transformer_weights if transformer_weights is not None else mx.load(str(transformer_weight_path))
             if has_quantized_weights(raw_weights):
                 # Quantized weights + per-run LoRA: re-quantize in-memory using float weights
                 float_weight_path = model_path / weight_file
@@ -1436,10 +1497,12 @@ def generate_video(
             else:
                 lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
                 weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
+        elif transformer_weights is not None:
+            weights_override = transformer_weights
 
         if transformer_local is None:
             transformer_local = LTXModel.from_pretrained(
-                model_path=transformer_weight_path,
+                model_path=unified_path if transformer_weights is not None else transformer_weight_path,
                 config=config,
                 strict=False,
                 weights_override=weights_override,
@@ -1468,7 +1531,10 @@ def generate_video(
 
         if is_i2v or video_conditionings:
             with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
-                vae_encoder = load_vae_encoder(str(weight_file_path))
+                vae_encoder = load_vae_encoder(
+                    str(weight_file_path),
+                    weights_override=_unified_subset("vae_encoder."),
+                )
                 mx.eval(vae_encoder.parameters())
 
                 for img_path, frame_idx, strength in images_list:
@@ -1578,7 +1644,11 @@ def generate_video(
             upsampler = load_upsampler(str(model_path / 'ltx-2-spatial-upscaler-x2-1.0.safetensors'))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = load_vae_decoder(str(_resolve_vae_source()), timestep_conditioning=None)
+            vae_decoder = load_vae_decoder(
+                str(_resolve_vae_source()),
+                timestep_conditioning=None,
+                weights_override=_unified_subset("vae_decoder."),
+            )
 
             latents = upsample_latents(latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
             mx.eval(latents)
@@ -1663,7 +1733,10 @@ def generate_video(
         dev_conditionings = []
         if is_i2v:
             with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
-                vae_encoder = load_vae_encoder(str(weight_file_path))
+                vae_encoder = load_vae_encoder(
+                    str(weight_file_path),
+                    weights_override=_unified_subset("vae_encoder."),
+                )
                 mx.eval(vae_encoder.parameters())
 
                 for img_path, frame_idx, strength in images_list:
@@ -1750,7 +1823,11 @@ def generate_video(
         _log_memory("denoise complete", mem_log)
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
-        vae_decoder = load_vae_decoder(str(_resolve_vae_source()), timestep_conditioning=None)
+        vae_decoder = load_vae_decoder(
+            str(_resolve_vae_source()),
+            timestep_conditioning=None,
+            weights_override=_unified_subset("vae_decoder."),
+        )
 
     del transformer
     mx.clear_cache()
@@ -1886,8 +1963,8 @@ def generate_video(
     audio_np = None
     if audio and audio_latents is not None:
         with console.status("[blue]🔊 Decoding audio...[/]", spinner="dots"):
-            audio_decoder = load_audio_decoder(model_path, pipeline)
-            vocoder = load_vocoder(model_path, pipeline)
+            audio_decoder = load_audio_decoder(model_path, pipeline, unified_weights=unified_weights)
+            vocoder = load_vocoder(model_path, pipeline, unified_weights=unified_weights)
             mx.eval(audio_decoder.parameters(), vocoder.parameters())
 
             mel_spectrogram = audio_decoder(audio_latents)
