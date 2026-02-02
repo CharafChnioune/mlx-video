@@ -441,6 +441,16 @@ def sanitize_vocoder_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array
                 continue
             new_key = key.replace("vocoder.", "")
 
+        # Handle alternate key names from upstream checkpoints
+        if new_key.startswith("upsamplers."):
+            new_key = new_key.replace("upsamplers.", "ups.")
+        elif new_key.startswith("resnets."):
+            new_key = new_key.replace("resnets.", "resblocks.")
+        elif new_key.startswith("conv_in."):
+            new_key = new_key.replace("conv_in.", "conv_pre.")
+        elif new_key.startswith("conv_out."):
+            new_key = new_key.replace("conv_out.", "conv_post.")
+
         # Handle ModuleList indices -> dict keys
         # PyTorch: ups.0, ups.1, ... -> ups.0, ups.1, ...
         # PyTorch: resblocks.0, resblocks.1, ... -> resblocks.0, resblocks.1, ...
