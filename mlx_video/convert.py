@@ -431,29 +431,32 @@ def sanitize_vocoder_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array
     """
     sanitized = {}
 
+    has_prefix = any(k.startswith("vocoder.") for k in weights.keys())
     for key, value in weights.items():
         new_key = key
 
         # Handle vocoder weights
-        if key.startswith("vocoder."):
+        if has_prefix:
+            if not key.startswith("vocoder."):
+                continue
             new_key = key.replace("vocoder.", "")
 
-            # Handle ModuleList indices -> dict keys
-            # PyTorch: ups.0, ups.1, ... -> ups.0, ups.1, ...
-            # PyTorch: resblocks.0, resblocks.1, ... -> resblocks.0, resblocks.1, ...
+        # Handle ModuleList indices -> dict keys
+        # PyTorch: ups.0, ups.1, ... -> ups.0, ups.1, ...
+        # PyTorch: resblocks.0, resblocks.1, ... -> resblocks.0, resblocks.1, ...
 
-            # Handle Conv1d weight shape conversion
-            # PyTorch: (out_channels, in_channels, kernel)
-            # MLX: (out_channels, kernel, in_channels)
-            if "weight" in new_key and value.ndim == 3:
-                if "ups" in new_key:
-                    # ConvTranspose1d: PyTorch (in_ch, out_ch, kernel) -> MLX (out_ch, kernel, in_ch)
-                    value = mx.transpose(value, (1, 2, 0))
-                else:
-                    # Conv1d: PyTorch (out_ch, in_ch, kernel) -> MLX (out_ch, kernel, in_ch)
-                    value = mx.transpose(value, (0, 2, 1))
+        # Handle Conv1d weight shape conversion
+        # PyTorch: (out_channels, in_channels, kernel)
+        # MLX: (out_channels, kernel, in_channels)
+        if "weight" in new_key and value.ndim == 3:
+            if "ups" in new_key:
+                # ConvTranspose1d: PyTorch (in_ch, out_ch, kernel) -> MLX (out_ch, kernel, in_ch)
+                value = mx.transpose(value, (1, 2, 0))
+            else:
+                # Conv1d: PyTorch (out_ch, in_ch, kernel) -> MLX (out_ch, kernel, in_ch)
+                value = mx.transpose(value, (0, 2, 1))
 
-            sanitized[new_key] = value
+        sanitized[new_key] = value
 
     return sanitized
 
