@@ -371,14 +371,26 @@ def denoise_distilled(
 
     desc = "[cyan]Denoising A/V[/]" if enable_audio else "[cyan]Denoising[/]"
     num_steps = len(sigmas) - 1
+    sigmas_mx = mx.array(sigmas, dtype=dtype)
+
+    b, c, f, h, w = latents.shape
+    num_tokens = f * h * w
 
     denoise_mask_flat = None
     if state is not None:
-        b, c, f, h, w = latents.shape
-        num_tokens = f * h * w
         denoise_mask_flat = mx.reshape(state.denoise_mask, (b, 1, f, 1, 1))
         denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
         denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
+
+    if denoise_mask_flat is None:
+        video_timesteps_mask = mx.ones((b, num_tokens), dtype=dtype)
+    else:
+        video_timesteps_mask = denoise_mask_flat.astype(dtype)
+
+    audio_timesteps_mask = None
+    if enable_audio:
+        ab, ac, at, af = audio_latents.shape
+        audio_timesteps_mask = mx.ones((ab, at), dtype=dtype)
 
     if compile_step and enable_audio:
         def step_fn(
@@ -391,10 +403,7 @@ def denoise_distilled(
             num_tokens = f * h * w
             latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
 
-            if denoise_mask_flat is not None:
-                timesteps = sigma_in.astype(dtype) * denoise_mask_flat
-            else:
-                timesteps = mx.full((b, num_tokens), sigma_in, dtype=dtype)
+            timesteps = sigma_in * video_timesteps_mask
 
             video_modality = Modality(
                 latent=latents_flat,
@@ -411,7 +420,7 @@ def denoise_distilled(
 
             audio_modality = Modality(
                 latent=audio_flat,
-                timesteps=mx.full((ab, at), sigma_in, dtype=dtype),
+                timesteps=sigma_in * audio_timesteps_mask,
                 positions=audio_positions,
                 context=audio_embeddings,
                 context_mask=None,
@@ -453,11 +462,7 @@ def denoise_distilled(
             b, c, f, h, w = latents_in.shape
             num_tokens = f * h * w
             latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
-
-            if denoise_mask_flat is not None:
-                timesteps = sigma_in.astype(dtype) * denoise_mask_flat
-            else:
-                timesteps = mx.full((b, num_tokens), sigma_in, dtype=dtype)
+            timesteps = sigma_in * video_timesteps_mask
 
             video_modality = Modality(
                 latent=latents_flat,
@@ -500,8 +505,8 @@ def denoise_distilled(
         for i in range(num_steps):
             sigma = sigmas[i]
             sigma_next = sigmas[i + 1]
-            sigma_mx = mx.array(sigma, dtype=dtype)
-            sigma_next_mx = mx.array(sigma_next, dtype=dtype)
+            sigma_mx = sigmas_mx[i]
+            sigma_next_mx = sigmas_mx[i + 1]
 
             if step_fn is not None:
                 if enable_audio:
@@ -509,14 +514,8 @@ def denoise_distilled(
                 else:
                     latents = step_fn(latents, sigma_mx, sigma_next_mx)
             else:
-                b, c, f, h, w = latents.shape
-                num_tokens = f * h * w
                 latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
-
-                if denoise_mask_flat is not None:
-                    timesteps = sigma_mx * denoise_mask_flat
-                else:
-                    timesteps = mx.full((b, num_tokens), sigma_mx, dtype=dtype)
+                timesteps = sigma_mx * video_timesteps_mask
 
                 video_modality = Modality(
                     latent=latents_flat,
@@ -529,13 +528,12 @@ def denoise_distilled(
 
                 audio_modality = None
                 if enable_audio:
-                    ab, ac, at, af = audio_latents.shape
                     audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
                     audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
 
                     audio_modality = Modality(
                         latent=audio_flat,
-                        timesteps=mx.full((ab, at), sigma_mx, dtype=dtype),
+                        timesteps=sigma_mx * audio_timesteps_mask,
                         positions=audio_positions,
                         context=audio_embeddings,
                         context_mask=None,
@@ -613,16 +611,23 @@ def denoise_dev(
         latents = state.latent
 
     sigmas_list = sigmas.tolist()
+    sigmas_mx = sigmas.astype(dtype)
     use_cfg = cfg_scale != 1.0
     num_steps = len(sigmas_list) - 1
 
+    b, c, f, h, w = latents.shape
+    num_tokens = f * h * w
+
     denoise_mask_flat = None
     if state is not None:
-        b, c, f, h, w = latents.shape
-        num_tokens = f * h * w
         denoise_mask_flat = mx.reshape(state.denoise_mask, (b, 1, f, 1, 1))
         denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
         denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
+
+    if denoise_mask_flat is None:
+        video_timesteps_mask = mx.ones((b, num_tokens), dtype=dtype)
+    else:
+        video_timesteps_mask = denoise_mask_flat.astype(dtype)
 
     if compile_step:
         def step_fn(
@@ -633,11 +638,7 @@ def denoise_dev(
             b, c, f, h, w = latents_in.shape
             num_tokens = f * h * w
             latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
-
-            if denoise_mask_flat is not None:
-                timesteps = sigma_in.astype(dtype) * denoise_mask_flat
-            else:
-                timesteps = mx.full((b, num_tokens), sigma_in, dtype=dtype)
+            timesteps = sigma_in * video_timesteps_mask
 
             video_modality_pos = Modality(
                 latent=latents_flat,
@@ -709,20 +710,14 @@ def denoise_dev(
         for i in range(num_steps):
             sigma = sigmas_list[i]
             sigma_next = sigmas_list[i + 1]
-            sigma_mx = mx.array(sigma, dtype=dtype)
-            sigma_next_mx = mx.array(sigma_next, dtype=dtype)
+            sigma_mx = sigmas_mx[i]
+            sigma_next_mx = sigmas_mx[i + 1]
 
             if step_fn is not None:
                 latents = step_fn(latents, sigma_mx, sigma_next_mx)
             else:
-                b, c, f, h, w = latents.shape
-                num_tokens = f * h * w
                 latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
-
-                if denoise_mask_flat is not None:
-                    timesteps = sigma_mx * denoise_mask_flat
-                else:
-                    timesteps = mx.full((b, num_tokens), sigma_mx, dtype=dtype)
+                timesteps = sigma_mx * video_timesteps_mask
 
                 # Positive conditioning pass
                 video_modality_pos = Modality(
@@ -804,16 +799,26 @@ def denoise_dev_av(
         video_latents = video_state.latent
 
     sigmas_list = sigmas.tolist()
+    sigmas_mx = sigmas.astype(dtype)
     use_cfg = cfg_scale != 1.0
     num_steps = len(sigmas_list) - 1
 
+    b, c, f, h, w = video_latents.shape
+    num_video_tokens = f * h * w
+
     denoise_mask_flat = None
     if video_state is not None:
-        b, c, f, h, w = video_latents.shape
-        num_video_tokens = f * h * w
         denoise_mask_flat = mx.reshape(video_state.denoise_mask, (b, 1, f, 1, 1))
         denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
         denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_video_tokens))
+
+    if denoise_mask_flat is None:
+        video_timesteps_mask = mx.ones((b, num_video_tokens), dtype=dtype)
+    else:
+        video_timesteps_mask = denoise_mask_flat.astype(dtype)
+
+    ab, ac, at, af = audio_latents.shape
+    audio_timesteps_mask = mx.ones((ab, at), dtype=dtype)
 
     # Precompute video RoPE
     precomputed_video_rope = precompute_freqs_cis(
@@ -855,12 +860,8 @@ def denoise_dev_av(
             audio_flat = mx.transpose(audio_latents_in, (0, 2, 1, 3))
             audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
 
-            if denoise_mask_flat is not None:
-                video_timesteps = sigma_in.astype(dtype) * denoise_mask_flat
-            else:
-                video_timesteps = mx.full((b, num_video_tokens), sigma_in, dtype=dtype)
-
-            audio_timesteps = mx.full((ab, at), sigma_in, dtype=dtype)
+            video_timesteps = sigma_in * video_timesteps_mask
+            audio_timesteps = sigma_in * audio_timesteps_mask
 
             video_modality_pos = Modality(
                 latent=video_flat, timesteps=video_timesteps, positions=video_positions,
@@ -939,29 +940,21 @@ def denoise_dev_av(
         for i in range(num_steps):
             sigma = sigmas_list[i]
             sigma_next = sigmas_list[i + 1]
-            sigma_mx = mx.array(sigma, dtype=dtype)
-            sigma_next_mx = mx.array(sigma_next, dtype=dtype)
+            sigma_mx = sigmas_mx[i]
+            sigma_next_mx = sigmas_mx[i + 1]
 
             if step_fn is not None:
                 video_latents, audio_latents = step_fn(video_latents, audio_latents, sigma_mx, sigma_next_mx)
             else:
-                # Flatten video latents
-                b, c, f, h, w = video_latents.shape
-                num_video_tokens = f * h * w
                 video_flat = mx.transpose(mx.reshape(video_latents, (b, c, -1)), (0, 2, 1))
 
                 # Flatten audio latents
-                ab, ac, at, af = audio_latents.shape
                 audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
                 audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
 
                 # Compute timesteps
-                if denoise_mask_flat is not None:
-                    video_timesteps = sigma_mx * denoise_mask_flat
-                else:
-                    video_timesteps = mx.full((b, num_video_tokens), sigma_mx, dtype=dtype)
-
-                audio_timesteps = mx.full((ab, at), sigma_mx, dtype=dtype)
+                video_timesteps = sigma_mx * video_timesteps_mask
+                audio_timesteps = sigma_mx * audio_timesteps_mask
 
                 # Positive conditioning pass
                 video_modality_pos = Modality(
