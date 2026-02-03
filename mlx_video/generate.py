@@ -193,6 +193,20 @@ def cfg_delta(cond: mx.array, uncond: mx.array, scale: float) -> mx.array:
     return (scale - 1.0) * (cond - uncond)
 
 
+def _start_metal_capture(path: Path) -> bool:
+    """Start a Metal GPU capture if available.
+
+    Returns True when a capture started successfully.
+    """
+    if not hasattr(mx, "metal") or not mx.metal.is_available():
+        console.print("[yellow]⚠️  Metal capture requested, but Metal backend is unavailable.[/]")
+        return False
+    if path.exists():
+        raise FileExistsError(f"Capture path already exists: {path}")
+    mx.metal.start_capture(str(path))
+    return True
+
+
 def ltx2_scheduler(
     steps: int,
     num_tokens: Optional[int] = None,
@@ -1363,6 +1377,9 @@ def generate_video(
     compile_step: bool = False,
     compile_shapeless: bool = False,
     cfg_batch: bool = False,
+    metal_capture: bool = False,
+    metal_capture_path: Optional[str] = None,
+    metal_capture_phase: str = "denoise",
     loras: Optional[list[tuple[str, float]]] = None,
     checkpoint_path: Optional[str] = None,
     auto_output_name: bool = False,
@@ -1413,12 +1430,26 @@ def generate_video(
         compile_step: Compile denoise step for repeated execution
         compile_shapeless: Allow recompilation for varying shapes (slower, more flexible)
         cfg_batch: If True, batch CFG pos/neg into one forward (more memory)
+        metal_capture: Enable Metal GPU capture (requires MTL_CAPTURE_ENABLED=1)
+        metal_capture_path: Path for the .gputrace output (must not exist)
+        metal_capture_phase: "denoise", "decode", or "all"
         loras: Optional list of (path, strength) LoRA weights to merge
         checkpoint_path: Optional explicit checkpoint .safetensors file to load
         auto_output_name: If True, auto-generate output filename from prompt
         output_name_model: Optional model repo for filename generation
     """
     start_time = time.time()
+    capture_path = None
+    capture_phase = metal_capture_phase
+    capture_started = False
+    if metal_capture:
+        if metal_capture_path:
+            capture_path = Path(metal_capture_path)
+        else:
+            capture_path = Path(output_path).with_suffix(".gputrace")
+        if capture_phase not in ("denoise", "decode", "all"):
+            console.print("[yellow]⚠️  Invalid metal capture phase; using 'denoise'.[/]")
+            capture_phase = "denoise"
     if cache_limit_gb is not None:
         limit_bytes = int(cache_limit_gb * (1024 ** 3))
         if hasattr(mx, "set_cache_limit"):
@@ -2220,6 +2251,13 @@ def generate_video(
             _debug_stats("audio_latents_initial", audio_latents)
 
         # Denoise with CFG
+        if metal_capture and capture_phase in ("denoise", "all") and capture_path is not None:
+            try:
+                capture_started = _start_metal_capture(capture_path)
+                if capture_started:
+                    console.print(f"[dim]Metal capture started: {capture_path}[/]")
+            except Exception as exc:
+                console.print(f"[yellow]⚠️  Could not start Metal capture: {exc}[/]")
         if audio:
             latents, audio_latents = denoise_dev_av(
                 latents, audio_latents,
@@ -2241,6 +2279,10 @@ def generate_video(
                 compile_shapeless=compile_shapeless,
                 cfg_batch=cfg_batch,
             )
+        if capture_started and capture_phase in ("denoise", "all"):
+            mx.metal.stop_capture()
+            capture_started = False
+            console.print(f"[dim]Metal capture saved: {capture_path}[/]")
         _log_memory("denoise complete", mem_log)
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
@@ -2257,6 +2299,14 @@ def generate_video(
     # ==========================================================================
     # Decode and save outputs (common to both pipelines)
     # ==========================================================================
+
+    if metal_capture and capture_phase in ("decode", "all") and capture_path is not None:
+        try:
+            capture_started = _start_metal_capture(capture_path)
+            if capture_started:
+                console.print(f"[dim]Metal capture started: {capture_path}[/]")
+        except Exception as exc:
+            console.print(f"[yellow]⚠️  Could not start Metal capture: {exc}[/]")
 
     console.print("\n[blue]🎞️  Decoding video...[/]")
 
@@ -2422,6 +2472,10 @@ def generate_video(
                 console.print("[yellow]⚠️  Audio mux failed and temp video missing; leaving output unchanged.[/]")
 
     del vae_decoder
+    if capture_started and capture_phase in ("decode", "all"):
+        mx.metal.stop_capture()
+        capture_started = False
+        console.print(f"[dim]Metal capture saved: {capture_path}[/]")
     mx.clear_cache()
     _log_memory("after decode", mem_log)
 
@@ -2636,6 +2690,15 @@ Examples:
         help="Batch CFG pos/neg in one forward (faster, higher memory)",
     )
     parser.add_argument("--no-cfg-batch", action="store_true", help="Disable CFG batching even if env enables it")
+    parser.add_argument("--metal-capture", action="store_true", help="Capture Metal GPU trace (.gputrace)")
+    parser.add_argument("--metal-capture-path", type=str, default=None, help="Path to .gputrace file")
+    parser.add_argument(
+        "--metal-capture-phase",
+        type=str,
+        choices=["denoise", "decode", "all"],
+        default="denoise",
+        help="Which phase to capture: denoise, decode, or all",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Alias for --steps")
     parser.add_argument("--cfg-guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
     parser.add_argument("--guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
@@ -2749,6 +2812,9 @@ Examples:
         compile_step=args.compile,
         compile_shapeless=args.compile_shapeless,
         cfg_batch=args.cfg_batch,
+        metal_capture=args.metal_capture,
+        metal_capture_path=args.metal_capture_path,
+        metal_capture_phase=args.metal_capture_phase,
         loras=loras,
         checkpoint_path=args.checkpoint_path,
         auto_output_name=args.auto_output_name,
