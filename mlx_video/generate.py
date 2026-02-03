@@ -602,6 +602,7 @@ def denoise_dev(
     eval_interval: int = 1,
     compile_step: bool = False,
     compile_shapeless: bool = False,
+    cfg_batch: bool = False,
 ) -> mx.array:
     """Run denoising loop for dev pipeline with CFG."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -613,6 +614,7 @@ def denoise_dev(
     sigmas_list = sigmas.tolist()
     sigmas_mx = sigmas.astype(dtype)
     use_cfg = cfg_scale != 1.0
+    cfg_batch = cfg_batch and use_cfg
     num_steps = len(sigmas_list) - 1
 
     b, c, f, h, w = latents.shape
@@ -640,31 +642,48 @@ def denoise_dev(
             latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
             timesteps = sigma_in * video_timesteps_mask
 
-            video_modality_pos = Modality(
-                latent=latents_flat,
-                timesteps=timesteps,
-                positions=positions,
-                context=text_embeddings_pos,
-                context_mask=None,
-                enabled=True,
-                positional_embeddings=precomputed_rope,
-            )
-            velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
-
-            if use_cfg:
-                video_modality_neg = Modality(
+            if cfg_batch:
+                latents_cat = mx.concatenate([latents_flat, latents_flat], axis=0)
+                timesteps_cat = mx.concatenate([timesteps, timesteps], axis=0)
+                context_cat = mx.concatenate([text_embeddings_pos, text_embeddings_neg], axis=0)
+                video_modality = Modality(
+                    latent=latents_cat,
+                    timesteps=timesteps_cat,
+                    positions=positions_cfg,
+                    context=context_cat,
+                    context_mask=None,
+                    enabled=True,
+                    positional_embeddings=precomputed_rope_cfg,
+                )
+                velocity_cat, _ = transformer(video=video_modality, audio=None)
+                velocity_pos, velocity_neg = mx.split(velocity_cat, 2, axis=0)
+                velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
+            else:
+                video_modality_pos = Modality(
                     latent=latents_flat,
                     timesteps=timesteps,
                     positions=positions,
-                    context=text_embeddings_neg,
+                    context=text_embeddings_pos,
                     context_mask=None,
                     enabled=True,
                     positional_embeddings=precomputed_rope,
                 )
-                velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
-                velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
-            else:
-                velocity_flat = velocity_pos
+                velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
+
+                if use_cfg:
+                    video_modality_neg = Modality(
+                        latent=latents_flat,
+                        timesteps=timesteps,
+                        positions=positions,
+                        context=text_embeddings_neg,
+                        context_mask=None,
+                        enabled=True,
+                        positional_embeddings=precomputed_rope,
+                    )
+                    velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
+                    velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
+                else:
+                    velocity_flat = velocity_pos
 
             velocity = mx.reshape(mx.transpose(velocity_flat, (0, 2, 1)), (b, c, f, h, w))
             denoised = to_denoised(latents_in, velocity, sigma_in)
@@ -696,6 +715,15 @@ def denoise_dev(
     )
     mx.eval(precomputed_rope)
 
+    positions_cfg = positions
+    precomputed_rope_cfg = precomputed_rope
+    if cfg_batch:
+        positions_cfg = mx.broadcast_to(positions, (b * 2,) + positions.shape[1:])
+        precomputed_rope_cfg = (
+            mx.broadcast_to(precomputed_rope[0], (b * 2,) + precomputed_rope[0].shape[1:]),
+            mx.broadcast_to(precomputed_rope[1], (b * 2,) + precomputed_rope[1].shape[1:]),
+        )
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -719,35 +747,52 @@ def denoise_dev(
                 latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
                 timesteps = sigma_mx * video_timesteps_mask
 
-                # Positive conditioning pass
-                video_modality_pos = Modality(
-                    latent=latents_flat,
-                    timesteps=timesteps,
-                    positions=positions,
-                    context=text_embeddings_pos,
-                    context_mask=None,
-                    enabled=True,
-                    positional_embeddings=precomputed_rope,
-                )
-                velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
-
-                if use_cfg:
-                    # Negative conditioning pass
-                    video_modality_neg = Modality(
+                if cfg_batch:
+                    latents_cat = mx.concatenate([latents_flat, latents_flat], axis=0)
+                    timesteps_cat = mx.concatenate([timesteps, timesteps], axis=0)
+                    context_cat = mx.concatenate([text_embeddings_pos, text_embeddings_neg], axis=0)
+                    video_modality = Modality(
+                        latent=latents_cat,
+                        timesteps=timesteps_cat,
+                        positions=positions_cfg,
+                        context=context_cat,
+                        context_mask=None,
+                        enabled=True,
+                        positional_embeddings=precomputed_rope_cfg,
+                    )
+                    velocity_cat, _ = transformer(video=video_modality, audio=None)
+                    velocity_pos, velocity_neg = mx.split(velocity_cat, 2, axis=0)
+                    velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
+                else:
+                    # Positive conditioning pass
+                    video_modality_pos = Modality(
                         latent=latents_flat,
                         timesteps=timesteps,
                         positions=positions,
-                        context=text_embeddings_neg,
+                        context=text_embeddings_pos,
                         context_mask=None,
                         enabled=True,
                         positional_embeddings=precomputed_rope,
                     )
-                    velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
+                    velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
 
-                    # Apply CFG
-                    velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
-                else:
-                    velocity_flat = velocity_pos
+                    if use_cfg:
+                        # Negative conditioning pass
+                        video_modality_neg = Modality(
+                            latent=latents_flat,
+                            timesteps=timesteps,
+                            positions=positions,
+                            context=text_embeddings_neg,
+                            context_mask=None,
+                            enabled=True,
+                            positional_embeddings=precomputed_rope,
+                        )
+                        velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
+
+                        # Apply CFG
+                        velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
+                    else:
+                        velocity_flat = velocity_pos
 
                 velocity = mx.reshape(mx.transpose(velocity_flat, (0, 2, 1)), (b, c, f, h, w))
                 denoised = to_denoised(latents, velocity, sigma_mx)
@@ -790,6 +835,7 @@ def denoise_dev_av(
     eval_interval: int = 1,
     compile_step: bool = False,
     compile_shapeless: bool = False,
+    cfg_batch: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG and audio."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -801,6 +847,7 @@ def denoise_dev_av(
     sigmas_list = sigmas.tolist()
     sigmas_mx = sigmas.astype(dtype)
     use_cfg = cfg_scale != 1.0
+    cfg_batch = cfg_batch and use_cfg
     num_steps = len(sigmas_list) - 1
 
     b, c, f, h, w = video_latents.shape
@@ -845,6 +892,22 @@ def denoise_dev_av(
     )
     mx.eval(precomputed_video_rope, precomputed_audio_rope)
 
+    video_positions_cfg = video_positions
+    audio_positions_cfg = audio_positions
+    precomputed_video_rope_cfg = precomputed_video_rope
+    precomputed_audio_rope_cfg = precomputed_audio_rope
+    if cfg_batch:
+        video_positions_cfg = mx.broadcast_to(video_positions, (b * 2,) + video_positions.shape[1:])
+        audio_positions_cfg = mx.broadcast_to(audio_positions, (ab * 2,) + audio_positions.shape[1:])
+        precomputed_video_rope_cfg = (
+            mx.broadcast_to(precomputed_video_rope[0], (b * 2,) + precomputed_video_rope[0].shape[1:]),
+            mx.broadcast_to(precomputed_video_rope[1], (b * 2,) + precomputed_video_rope[1].shape[1:]),
+        )
+        precomputed_audio_rope_cfg = (
+            mx.broadcast_to(precomputed_audio_rope[0], (ab * 2,) + precomputed_audio_rope[0].shape[1:]),
+            mx.broadcast_to(precomputed_audio_rope[1], (ab * 2,) + precomputed_audio_rope[1].shape[1:]),
+        )
+
     if compile_step:
         def step_fn(
             video_latents_in: mx.array,
@@ -863,35 +926,59 @@ def denoise_dev_av(
             video_timesteps = sigma_in * video_timesteps_mask
             audio_timesteps = sigma_in * audio_timesteps_mask
 
-            video_modality_pos = Modality(
-                latent=video_flat, timesteps=video_timesteps, positions=video_positions,
-                context=video_embeddings_pos, context_mask=None, enabled=True,
-                positional_embeddings=precomputed_video_rope,
-            )
-            audio_modality_pos = Modality(
-                latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
-                context=audio_embeddings_pos, context_mask=None, enabled=True,
-                positional_embeddings=precomputed_audio_rope,
-            )
-            video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
+            if cfg_batch:
+                video_latents_cat = mx.concatenate([video_flat, video_flat], axis=0)
+                audio_latents_cat = mx.concatenate([audio_flat, audio_flat], axis=0)
+                video_timesteps_cat = mx.concatenate([video_timesteps, video_timesteps], axis=0)
+                audio_timesteps_cat = mx.concatenate([audio_timesteps, audio_timesteps], axis=0)
+                video_context_cat = mx.concatenate([video_embeddings_pos, video_embeddings_neg], axis=0)
+                audio_context_cat = mx.concatenate([audio_embeddings_pos, audio_embeddings_neg], axis=0)
 
-            if use_cfg:
-                video_modality_neg = Modality(
-                    latent=video_flat, timesteps=video_timesteps, positions=video_positions,
-                    context=video_embeddings_neg, context_mask=None, enabled=True,
-                    positional_embeddings=precomputed_video_rope,
+                video_modality = Modality(
+                    latent=video_latents_cat, timesteps=video_timesteps_cat, positions=video_positions_cfg,
+                    context=video_context_cat, context_mask=None, enabled=True,
+                    positional_embeddings=precomputed_video_rope_cfg,
                 )
-                audio_modality_neg = Modality(
-                    latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
-                    context=audio_embeddings_neg, context_mask=None, enabled=True,
-                    positional_embeddings=precomputed_audio_rope,
+                audio_modality = Modality(
+                    latent=audio_latents_cat, timesteps=audio_timesteps_cat, positions=audio_positions_cfg,
+                    context=audio_context_cat, context_mask=None, enabled=True,
+                    positional_embeddings=precomputed_audio_rope_cfg,
                 )
-                video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
+                video_vel_cat, audio_vel_cat = transformer(video=video_modality, audio=audio_modality)
+                video_vel_pos, video_vel_neg = mx.split(video_vel_cat, 2, axis=0)
+                audio_vel_pos, audio_vel_neg = mx.split(audio_vel_cat, 2, axis=0)
                 video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
                 audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
             else:
-                video_velocity_flat = video_vel_pos
-                audio_velocity_flat = audio_vel_pos
+                video_modality_pos = Modality(
+                    latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                    context=video_embeddings_pos, context_mask=None, enabled=True,
+                    positional_embeddings=precomputed_video_rope,
+                )
+                audio_modality_pos = Modality(
+                    latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                    context=audio_embeddings_pos, context_mask=None, enabled=True,
+                    positional_embeddings=precomputed_audio_rope,
+                )
+                video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
+
+                if use_cfg:
+                    video_modality_neg = Modality(
+                        latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                        context=video_embeddings_neg, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_video_rope,
+                    )
+                    audio_modality_neg = Modality(
+                        latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                        context=audio_embeddings_neg, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_audio_rope,
+                    )
+                    video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
+                    video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
+                    audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
+                else:
+                    video_velocity_flat = video_vel_pos
+                    audio_velocity_flat = audio_vel_pos
 
             video_velocity = mx.reshape(mx.transpose(video_velocity_flat, (0, 2, 1)), (b, c, f, h, w))
             audio_velocity = mx.reshape(audio_velocity_flat, (ab, at, ac, af))
@@ -956,39 +1043,63 @@ def denoise_dev_av(
                 video_timesteps = sigma_mx * video_timesteps_mask
                 audio_timesteps = sigma_mx * audio_timesteps_mask
 
-                # Positive conditioning pass
-                video_modality_pos = Modality(
-                    latent=video_flat, timesteps=video_timesteps, positions=video_positions,
-                    context=video_embeddings_pos, context_mask=None, enabled=True,
-                    positional_embeddings=precomputed_video_rope,
-                )
-                audio_modality_pos = Modality(
-                    latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
-                    context=audio_embeddings_pos, context_mask=None, enabled=True,
-                    positional_embeddings=precomputed_audio_rope,
-                )
-                video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
+                if cfg_batch:
+                    video_latents_cat = mx.concatenate([video_flat, video_flat], axis=0)
+                    audio_latents_cat = mx.concatenate([audio_flat, audio_flat], axis=0)
+                    video_timesteps_cat = mx.concatenate([video_timesteps, video_timesteps], axis=0)
+                    audio_timesteps_cat = mx.concatenate([audio_timesteps, audio_timesteps], axis=0)
+                    video_context_cat = mx.concatenate([video_embeddings_pos, video_embeddings_neg], axis=0)
+                    audio_context_cat = mx.concatenate([audio_embeddings_pos, audio_embeddings_neg], axis=0)
 
-                if use_cfg:
-                    # Negative conditioning pass
-                    video_modality_neg = Modality(
-                        latent=video_flat, timesteps=video_timesteps, positions=video_positions,
-                        context=video_embeddings_neg, context_mask=None, enabled=True,
-                        positional_embeddings=precomputed_video_rope,
+                    video_modality = Modality(
+                        latent=video_latents_cat, timesteps=video_timesteps_cat, positions=video_positions_cfg,
+                        context=video_context_cat, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_video_rope_cfg,
                     )
-                    audio_modality_neg = Modality(
-                        latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
-                        context=audio_embeddings_neg, context_mask=None, enabled=True,
-                        positional_embeddings=precomputed_audio_rope,
+                    audio_modality = Modality(
+                        latent=audio_latents_cat, timesteps=audio_timesteps_cat, positions=audio_positions_cfg,
+                        context=audio_context_cat, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_audio_rope_cfg,
                     )
-                    video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
-
-                    # Apply CFG
+                    video_vel_cat, audio_vel_cat = transformer(video=video_modality, audio=audio_modality)
+                    video_vel_pos, video_vel_neg = mx.split(video_vel_cat, 2, axis=0)
+                    audio_vel_pos, audio_vel_neg = mx.split(audio_vel_cat, 2, axis=0)
                     video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
                     audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
                 else:
-                    video_velocity_flat = video_vel_pos
-                    audio_velocity_flat = audio_vel_pos
+                    # Positive conditioning pass
+                    video_modality_pos = Modality(
+                        latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                        context=video_embeddings_pos, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_video_rope,
+                    )
+                    audio_modality_pos = Modality(
+                        latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                        context=audio_embeddings_pos, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_audio_rope,
+                    )
+                    video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
+
+                    if use_cfg:
+                        # Negative conditioning pass
+                        video_modality_neg = Modality(
+                            latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                            context=video_embeddings_neg, context_mask=None, enabled=True,
+                            positional_embeddings=precomputed_video_rope,
+                        )
+                        audio_modality_neg = Modality(
+                            latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                            context=audio_embeddings_neg, context_mask=None, enabled=True,
+                            positional_embeddings=precomputed_audio_rope,
+                        )
+                        video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
+
+                        # Apply CFG
+                        video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
+                        audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
+                    else:
+                        video_velocity_flat = video_vel_pos
+                        audio_velocity_flat = audio_vel_pos
 
                 # Reshape velocities
                 video_velocity = mx.reshape(mx.transpose(video_velocity_flat, (0, 2, 1)), (b, c, f, h, w))
@@ -1251,6 +1362,7 @@ def generate_video(
     eval_interval: int = 1,
     compile_step: bool = False,
     compile_shapeless: bool = False,
+    cfg_batch: bool = False,
     loras: Optional[list[tuple[str, float]]] = None,
     checkpoint_path: Optional[str] = None,
     auto_output_name: bool = False,
@@ -1300,6 +1412,7 @@ def generate_video(
         eval_interval: Evaluate latents every N steps (reduces sync overhead)
         compile_step: Compile denoise step for repeated execution
         compile_shapeless: Allow recompilation for varying shapes (slower, more flexible)
+        cfg_batch: If True, batch CFG pos/neg into one forward (more memory)
         loras: Optional list of (path, strength) LoRA weights to merge
         checkpoint_path: Optional explicit checkpoint .safetensors file to load
         auto_output_name: If True, auto-generate output filename from prompt
@@ -2117,6 +2230,7 @@ def generate_video(
                 eval_interval=eval_interval,
                 compile_step=compile_step,
                 compile_shapeless=compile_shapeless,
+                cfg_batch=cfg_batch,
             )
         else:
             latents = denoise_dev(
@@ -2125,6 +2239,7 @@ def generate_video(
                 eval_interval=eval_interval,
                 compile_step=compile_step,
                 compile_shapeless=compile_shapeless,
+                cfg_batch=cfg_batch,
             )
         _log_memory("denoise complete", mem_log)
 
@@ -2511,9 +2626,16 @@ Examples:
     )
     env_compile = os.getenv("LTX_COMPILE", "").lower() in ("1", "true", "yes")
     env_compile_shapeless = os.getenv("LTX_COMPILE_SHAPELESS", "").lower() in ("1", "true", "yes")
+    env_cfg_batch = os.getenv("LTX_CFG_BATCH", "").lower() in ("1", "true", "yes")
     parser.add_argument("--compile", action="store_true", help="Compile denoise step for faster repeated execution")
     parser.add_argument("--compile-shapeless", action="store_true", help="Allow recompile on shape changes")
     parser.add_argument("--no-compile", action="store_true", help="Disable compilation even if env enables it")
+    parser.add_argument(
+        "--cfg-batch",
+        action="store_true",
+        help="Batch CFG pos/neg in one forward (faster, higher memory)",
+    )
+    parser.add_argument("--no-cfg-batch", action="store_true", help="Disable CFG batching even if env enables it")
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Alias for --steps")
     parser.add_argument("--cfg-guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
     parser.add_argument("--guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
@@ -2544,6 +2666,10 @@ Examples:
         args.compile_shapeless = False
     elif env_compile_shapeless:
         args.compile_shapeless = True
+    if args.no_cfg_batch:
+        args.cfg_batch = False
+    elif env_cfg_batch:
+        args.cfg_batch = True
 
     auto_output_name_model = None
     if args.auto_output_name:
@@ -2622,6 +2748,7 @@ Examples:
         eval_interval=args.eval_interval,
         compile_step=args.compile,
         compile_shapeless=args.compile_shapeless,
+        cfg_batch=args.cfg_batch,
         loras=loras,
         checkpoint_path=args.checkpoint_path,
         auto_output_name=args.auto_output_name,
