@@ -359,6 +359,8 @@ def denoise_distilled(
     audio_positions: Optional[mx.array] = None,
     audio_embeddings: Optional[mx.array] = None,
     eval_interval: int = 1,
+    compile_step: bool = False,
+    compile_shapeless: bool = False,
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     dtype = latents.dtype
@@ -369,6 +371,120 @@ def denoise_distilled(
 
     desc = "[cyan]Denoising A/V[/]" if enable_audio else "[cyan]Denoising[/]"
     num_steps = len(sigmas) - 1
+
+    denoise_mask_flat = None
+    if state is not None:
+        b, c, f, h, w = latents.shape
+        num_tokens = f * h * w
+        denoise_mask_flat = mx.reshape(state.denoise_mask, (b, 1, f, 1, 1))
+        denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
+        denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
+
+    if compile_step and enable_audio:
+        def step_fn(
+            latents_in: mx.array,
+            audio_latents_in: mx.array,
+            sigma_in: mx.array,
+            sigma_next_in: mx.array,
+        ) -> tuple[mx.array, mx.array]:
+            b, c, f, h, w = latents_in.shape
+            num_tokens = f * h * w
+            latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
+
+            if denoise_mask_flat is not None:
+                timesteps = sigma_in.astype(dtype) * denoise_mask_flat
+            else:
+                timesteps = mx.full((b, num_tokens), sigma_in, dtype=dtype)
+
+            video_modality = Modality(
+                latent=latents_flat,
+                timesteps=timesteps,
+                positions=positions,
+                context=text_embeddings,
+                context_mask=None,
+                enabled=True,
+            )
+
+            ab, ac, at, af = audio_latents_in.shape
+            audio_flat = mx.transpose(audio_latents_in, (0, 2, 1, 3))
+            audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
+
+            audio_modality = Modality(
+                latent=audio_flat,
+                timesteps=mx.full((ab, at), sigma_in, dtype=dtype),
+                positions=audio_positions,
+                context=audio_embeddings,
+                context_mask=None,
+                enabled=True,
+            )
+
+            velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
+            velocity = mx.reshape(mx.transpose(velocity, (0, 2, 1)), (b, c, f, h, w))
+            denoised = to_denoised(latents_in, velocity, sigma_in)
+
+            audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
+            audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
+            audio_denoised = to_denoised(audio_latents_in, audio_velocity, sigma_in)
+
+            if state is not None:
+                denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+
+            latents_f32 = latents_in.astype(mx.float32)
+            denoised_f32 = denoised.astype(mx.float32)
+            sigma_next_f32 = sigma_next_in.astype(mx.float32)
+            sigma_f32 = sigma_in.astype(mx.float32)
+            latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+
+            audio_latents_f32 = audio_latents_in.astype(mx.float32)
+            audio_denoised_f32 = audio_denoised.astype(mx.float32)
+            audio_latents_out = (
+                audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32
+            ).astype(dtype)
+
+            return latents_out, audio_latents_out
+
+        step_fn = mx.compile(step_fn, shapeless=compile_shapeless)
+    elif compile_step and not enable_audio:
+        def step_fn(
+            latents_in: mx.array,
+            sigma_in: mx.array,
+            sigma_next_in: mx.array,
+        ) -> mx.array:
+            b, c, f, h, w = latents_in.shape
+            num_tokens = f * h * w
+            latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
+
+            if denoise_mask_flat is not None:
+                timesteps = sigma_in.astype(dtype) * denoise_mask_flat
+            else:
+                timesteps = mx.full((b, num_tokens), sigma_in, dtype=dtype)
+
+            video_modality = Modality(
+                latent=latents_flat,
+                timesteps=timesteps,
+                positions=positions,
+                context=text_embeddings,
+                context_mask=None,
+                enabled=True,
+            )
+
+            velocity, _ = transformer(video=video_modality, audio=None)
+            velocity = mx.reshape(mx.transpose(velocity, (0, 2, 1)), (b, c, f, h, w))
+            denoised = to_denoised(latents_in, velocity, sigma_in)
+
+            if state is not None:
+                denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+
+            latents_f32 = latents_in.astype(mx.float32)
+            denoised_f32 = denoised.astype(mx.float32)
+            sigma_next_f32 = sigma_next_in.astype(mx.float32)
+            sigma_f32 = sigma_in.astype(mx.float32)
+            latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+            return latents_out
+
+        step_fn = mx.compile(step_fn, shapeless=compile_shapeless)
+    else:
+        step_fn = None
 
     with Progress(
         SpinnerColumn(),
@@ -382,74 +498,80 @@ def denoise_distilled(
         task = progress.add_task(desc, total=num_steps)
 
         for i in range(num_steps):
-            sigma, sigma_next = sigmas[i], sigmas[i + 1]
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            sigma_mx = mx.array(sigma, dtype=dtype)
+            sigma_next_mx = mx.array(sigma_next, dtype=dtype)
 
-            b, c, f, h, w = latents.shape
-            num_tokens = f * h * w
-            latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
-
-            if state is not None:
-                denoise_mask_flat = mx.reshape(state.denoise_mask, (b, 1, f, 1, 1))
-                denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
-                denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
-                timesteps = mx.array(sigma, dtype=dtype) * denoise_mask_flat
+            if step_fn is not None:
+                if enable_audio:
+                    latents, audio_latents = step_fn(latents, audio_latents, sigma_mx, sigma_next_mx)
+                else:
+                    latents = step_fn(latents, sigma_mx, sigma_next_mx)
             else:
-                timesteps = mx.full((b, num_tokens), sigma, dtype=dtype)
+                b, c, f, h, w = latents.shape
+                num_tokens = f * h * w
+                latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
 
-            video_modality = Modality(
-                latent=latents_flat,
-                timesteps=timesteps,
-                positions=positions,
-                context=text_embeddings,
-                context_mask=None,
-                enabled=True,
-            )
+                if denoise_mask_flat is not None:
+                    timesteps = sigma_mx * denoise_mask_flat
+                else:
+                    timesteps = mx.full((b, num_tokens), sigma_mx, dtype=dtype)
 
-            audio_modality = None
-            if enable_audio:
-                ab, ac, at, af = audio_latents.shape
-                audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
-                audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
-
-                audio_modality = Modality(
-                    latent=audio_flat,
-                    timesteps=mx.full((ab, at), sigma, dtype=dtype),
-                    positions=audio_positions,
-                    context=audio_embeddings,
+                video_modality = Modality(
+                    latent=latents_flat,
+                    timesteps=timesteps,
+                    positions=positions,
+                    context=text_embeddings,
                     context_mask=None,
                     enabled=True,
                 )
 
-            velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
+                audio_modality = None
+                if enable_audio:
+                    ab, ac, at, af = audio_latents.shape
+                    audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
+                    audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
 
-            velocity = mx.reshape(mx.transpose(velocity, (0, 2, 1)), (b, c, f, h, w))
-            denoised = to_denoised(latents, velocity, sigma)
+                    audio_modality = Modality(
+                        latent=audio_flat,
+                        timesteps=mx.full((ab, at), sigma_mx, dtype=dtype),
+                        positions=audio_positions,
+                        context=audio_embeddings,
+                        context_mask=None,
+                        enabled=True,
+                    )
 
-            audio_denoised = None
-            if enable_audio and audio_velocity is not None:
-                ab, ac, at, af = audio_latents.shape
-                audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
-                audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
-                audio_denoised = to_denoised(audio_latents, audio_velocity, sigma)
+                velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
 
-            if state is not None:
-                denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+                velocity = mx.reshape(mx.transpose(velocity, (0, 2, 1)), (b, c, f, h, w))
+                denoised = to_denoised(latents, velocity, sigma_mx)
 
-            if sigma_next > 0:
-                # Compute Euler step in float32 for precision (matching PyTorch behavior)
-                latents_f32 = latents.astype(mx.float32)
-                denoised_f32 = denoised.astype(mx.float32)
-                sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
-                sigma_f32 = mx.array(sigma, dtype=mx.float32)
-                latents = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
-                if enable_audio and audio_denoised is not None:
-                    audio_latents_f32 = audio_latents.astype(mx.float32)
-                    audio_denoised_f32 = audio_denoised.astype(mx.float32)
-                    audio_latents = (audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32).astype(dtype)
-            else:
-                latents = denoised
-                if enable_audio and audio_denoised is not None:
-                    audio_latents = audio_denoised
+                audio_denoised = None
+                if enable_audio and audio_velocity is not None:
+                    ab, ac, at, af = audio_latents.shape
+                    audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
+                    audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
+                    audio_denoised = to_denoised(audio_latents, audio_velocity, sigma_mx)
+
+                if state is not None:
+                    denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+
+                if sigma_next > 0:
+                    # Compute Euler step in float32 for precision (matching PyTorch behavior)
+                    latents_f32 = latents.astype(mx.float32)
+                    denoised_f32 = denoised.astype(mx.float32)
+                    sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
+                    sigma_f32 = mx.array(sigma, dtype=mx.float32)
+                    latents = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+                    if enable_audio and audio_denoised is not None:
+                        audio_latents_f32 = audio_latents.astype(mx.float32)
+                        audio_denoised_f32 = audio_denoised.astype(mx.float32)
+                        audio_latents = (audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32).astype(dtype)
+                else:
+                    latents = denoised
+                    if enable_audio and audio_denoised is not None:
+                        audio_latents = audio_denoised
 
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 if enable_audio:
@@ -480,6 +602,8 @@ def denoise_dev(
     verbose: bool = True,
     state: Optional[LatentState] = None,
     eval_interval: int = 1,
+    compile_step: bool = False,
+    compile_shapeless: bool = False,
 ) -> mx.array:
     """Run denoising loop for dev pipeline with CFG."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -491,6 +615,72 @@ def denoise_dev(
     sigmas_list = sigmas.tolist()
     use_cfg = cfg_scale != 1.0
     num_steps = len(sigmas_list) - 1
+
+    denoise_mask_flat = None
+    if state is not None:
+        b, c, f, h, w = latents.shape
+        num_tokens = f * h * w
+        denoise_mask_flat = mx.reshape(state.denoise_mask, (b, 1, f, 1, 1))
+        denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
+        denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
+
+    if compile_step:
+        def step_fn(
+            latents_in: mx.array,
+            sigma_in: mx.array,
+            sigma_next_in: mx.array,
+        ) -> mx.array:
+            b, c, f, h, w = latents_in.shape
+            num_tokens = f * h * w
+            latents_flat = mx.transpose(mx.reshape(latents_in, (b, c, -1)), (0, 2, 1))
+
+            if denoise_mask_flat is not None:
+                timesteps = sigma_in.astype(dtype) * denoise_mask_flat
+            else:
+                timesteps = mx.full((b, num_tokens), sigma_in, dtype=dtype)
+
+            video_modality_pos = Modality(
+                latent=latents_flat,
+                timesteps=timesteps,
+                positions=positions,
+                context=text_embeddings_pos,
+                context_mask=None,
+                enabled=True,
+                positional_embeddings=precomputed_rope,
+            )
+            velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
+
+            if use_cfg:
+                video_modality_neg = Modality(
+                    latent=latents_flat,
+                    timesteps=timesteps,
+                    positions=positions,
+                    context=text_embeddings_neg,
+                    context_mask=None,
+                    enabled=True,
+                    positional_embeddings=precomputed_rope,
+                )
+                velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
+                velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
+            else:
+                velocity_flat = velocity_pos
+
+            velocity = mx.reshape(mx.transpose(velocity_flat, (0, 2, 1)), (b, c, f, h, w))
+            denoised = to_denoised(latents_in, velocity, sigma_in)
+
+            if state is not None:
+                denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+
+            latents_f32 = latents_in.astype(mx.float32)
+            denoised_f32 = denoised.astype(mx.float32)
+            sigma_next_f32 = sigma_next_in.astype(mx.float32)
+            sigma_f32 = sigma_in.astype(mx.float32)
+            latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+            return latents_out
+
+        step_fn = mx.compile(step_fn, shapeless=compile_shapeless)
+    else:
+        step_fn = None
 
     # Precompute RoPE once
     precomputed_rope = precompute_freqs_cis(
@@ -519,64 +709,66 @@ def denoise_dev(
         for i in range(num_steps):
             sigma = sigmas_list[i]
             sigma_next = sigmas_list[i + 1]
+            sigma_mx = mx.array(sigma, dtype=dtype)
+            sigma_next_mx = mx.array(sigma_next, dtype=dtype)
 
-            b, c, f, h, w = latents.shape
-            num_tokens = f * h * w
-            latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
-
-            if state is not None:
-                denoise_mask_flat = mx.reshape(state.denoise_mask, (b, 1, f, 1, 1))
-                denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
-                denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_tokens))
-                timesteps = mx.array(sigma, dtype=dtype) * denoise_mask_flat
+            if step_fn is not None:
+                latents = step_fn(latents, sigma_mx, sigma_next_mx)
             else:
-                timesteps = mx.full((b, num_tokens), sigma, dtype=dtype)
+                b, c, f, h, w = latents.shape
+                num_tokens = f * h * w
+                latents_flat = mx.transpose(mx.reshape(latents, (b, c, -1)), (0, 2, 1))
 
-            # Positive conditioning pass
-            video_modality_pos = Modality(
-                latent=latents_flat,
-                timesteps=timesteps,
-                positions=positions,
-                context=text_embeddings_pos,
-                context_mask=None,
-                enabled=True,
-                positional_embeddings=precomputed_rope,
-            )
-            velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
+                if denoise_mask_flat is not None:
+                    timesteps = sigma_mx * denoise_mask_flat
+                else:
+                    timesteps = mx.full((b, num_tokens), sigma_mx, dtype=dtype)
 
-            if use_cfg:
-                # Negative conditioning pass
-                video_modality_neg = Modality(
+                # Positive conditioning pass
+                video_modality_pos = Modality(
                     latent=latents_flat,
                     timesteps=timesteps,
                     positions=positions,
-                    context=text_embeddings_neg,
+                    context=text_embeddings_pos,
                     context_mask=None,
                     enabled=True,
                     positional_embeddings=precomputed_rope,
                 )
-                velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
+                velocity_pos, _ = transformer(video=video_modality_pos, audio=None)
 
-                # Apply CFG
-                velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
-            else:
-                velocity_flat = velocity_pos
+                if use_cfg:
+                    # Negative conditioning pass
+                    video_modality_neg = Modality(
+                        latent=latents_flat,
+                        timesteps=timesteps,
+                        positions=positions,
+                        context=text_embeddings_neg,
+                        context_mask=None,
+                        enabled=True,
+                        positional_embeddings=precomputed_rope,
+                    )
+                    velocity_neg, _ = transformer(video=video_modality_neg, audio=None)
 
-            velocity = mx.reshape(mx.transpose(velocity_flat, (0, 2, 1)), (b, c, f, h, w))
-            denoised = to_denoised(latents, velocity, sigma)
+                    # Apply CFG
+                    velocity_flat = velocity_pos + (cfg_scale - 1.0) * (velocity_pos - velocity_neg)
+                else:
+                    velocity_flat = velocity_pos
 
-            if state is not None:
-                denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+                velocity = mx.reshape(mx.transpose(velocity_flat, (0, 2, 1)), (b, c, f, h, w))
+                denoised = to_denoised(latents, velocity, sigma_mx)
 
-            if sigma_next > 0:
-                # Compute Euler step in float32 for precision (matching PyTorch behavior)
-                latents_f32 = latents.astype(mx.float32)
-                denoised_f32 = denoised.astype(mx.float32)
-                sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
-                sigma_f32 = mx.array(sigma, dtype=mx.float32)
-                latents = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
-            else:
-                latents = denoised
+                if state is not None:
+                    denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
+
+                if sigma_next > 0:
+                    # Compute Euler step in float32 for precision (matching PyTorch behavior)
+                    latents_f32 = latents.astype(mx.float32)
+                    denoised_f32 = denoised.astype(mx.float32)
+                    sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
+                    sigma_f32 = mx.array(sigma, dtype=mx.float32)
+                    latents = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+                else:
+                    latents = denoised
 
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(latents)
@@ -601,6 +793,8 @@ def denoise_dev_av(
     verbose: bool = True,
     video_state: Optional[LatentState] = None,
     eval_interval: int = 1,
+    compile_step: bool = False,
+    compile_shapeless: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG and audio."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -612,6 +806,14 @@ def denoise_dev_av(
     sigmas_list = sigmas.tolist()
     use_cfg = cfg_scale != 1.0
     num_steps = len(sigmas_list) - 1
+
+    denoise_mask_flat = None
+    if video_state is not None:
+        b, c, f, h, w = video_latents.shape
+        num_video_tokens = f * h * w
+        denoise_mask_flat = mx.reshape(video_state.denoise_mask, (b, 1, f, 1, 1))
+        denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
+        denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_video_tokens))
 
     # Precompute video RoPE
     precomputed_video_rope = precompute_freqs_cis(
@@ -638,6 +840,91 @@ def denoise_dev_av(
     )
     mx.eval(precomputed_video_rope, precomputed_audio_rope)
 
+    if compile_step:
+        def step_fn(
+            video_latents_in: mx.array,
+            audio_latents_in: mx.array,
+            sigma_in: mx.array,
+            sigma_next_in: mx.array,
+        ) -> tuple[mx.array, mx.array]:
+            b, c, f, h, w = video_latents_in.shape
+            num_video_tokens = f * h * w
+            video_flat = mx.transpose(mx.reshape(video_latents_in, (b, c, -1)), (0, 2, 1))
+
+            ab, ac, at, af = audio_latents_in.shape
+            audio_flat = mx.transpose(audio_latents_in, (0, 2, 1, 3))
+            audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
+
+            if denoise_mask_flat is not None:
+                video_timesteps = sigma_in.astype(dtype) * denoise_mask_flat
+            else:
+                video_timesteps = mx.full((b, num_video_tokens), sigma_in, dtype=dtype)
+
+            audio_timesteps = mx.full((ab, at), sigma_in, dtype=dtype)
+
+            video_modality_pos = Modality(
+                latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                context=video_embeddings_pos, context_mask=None, enabled=True,
+                positional_embeddings=precomputed_video_rope,
+            )
+            audio_modality_pos = Modality(
+                latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                context=audio_embeddings_pos, context_mask=None, enabled=True,
+                positional_embeddings=precomputed_audio_rope,
+            )
+            video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
+
+            if use_cfg:
+                video_modality_neg = Modality(
+                    latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                    context=video_embeddings_neg, context_mask=None, enabled=True,
+                    positional_embeddings=precomputed_video_rope,
+                )
+                audio_modality_neg = Modality(
+                    latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                    context=audio_embeddings_neg, context_mask=None, enabled=True,
+                    positional_embeddings=precomputed_audio_rope,
+                )
+                video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
+                video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
+                audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
+            else:
+                video_velocity_flat = video_vel_pos
+                audio_velocity_flat = audio_vel_pos
+
+            video_velocity = mx.reshape(mx.transpose(video_velocity_flat, (0, 2, 1)), (b, c, f, h, w))
+            audio_velocity = mx.reshape(audio_velocity_flat, (ab, at, ac, af))
+            audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
+
+            video_denoised = to_denoised(video_latents_in, video_velocity, sigma_in)
+            audio_denoised = to_denoised(audio_latents_in, audio_velocity, sigma_in)
+
+            if video_state is not None:
+                video_denoised = apply_denoise_mask(
+                    video_denoised, video_state.clean_latent, video_state.denoise_mask
+                )
+
+            sigma_next_f32 = sigma_next_in.astype(mx.float32)
+            sigma_f32 = sigma_in.astype(mx.float32)
+
+            video_latents_f32 = video_latents_in.astype(mx.float32)
+            video_denoised_f32 = video_denoised.astype(mx.float32)
+            video_latents_out = (
+                video_denoised_f32 + sigma_next_f32 * (video_latents_f32 - video_denoised_f32) / sigma_f32
+            ).astype(dtype)
+
+            audio_latents_f32 = audio_latents_in.astype(mx.float32)
+            audio_denoised_f32 = audio_denoised.astype(mx.float32)
+            audio_latents_out = (
+                audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32
+            ).astype(dtype)
+
+            return video_latents_out, audio_latents_out
+
+        step_fn = mx.compile(step_fn, shapeless=compile_shapeless)
+    else:
+        step_fn = None
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -652,90 +939,98 @@ def denoise_dev_av(
         for i in range(num_steps):
             sigma = sigmas_list[i]
             sigma_next = sigmas_list[i + 1]
+            sigma_mx = mx.array(sigma, dtype=dtype)
+            sigma_next_mx = mx.array(sigma_next, dtype=dtype)
 
-            # Flatten video latents
-            b, c, f, h, w = video_latents.shape
-            num_video_tokens = f * h * w
-            video_flat = mx.transpose(mx.reshape(video_latents, (b, c, -1)), (0, 2, 1))
-
-            # Flatten audio latents
-            ab, ac, at, af = audio_latents.shape
-            audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
-            audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
-
-            # Compute timesteps
-            if video_state is not None:
-                denoise_mask_flat = mx.reshape(video_state.denoise_mask, (b, 1, f, 1, 1))
-                denoise_mask_flat = mx.broadcast_to(denoise_mask_flat, (b, 1, f, h, w))
-                denoise_mask_flat = mx.reshape(denoise_mask_flat, (b, num_video_tokens))
-                video_timesteps = mx.array(sigma, dtype=dtype) * denoise_mask_flat
+            if step_fn is not None:
+                video_latents, audio_latents = step_fn(video_latents, audio_latents, sigma_mx, sigma_next_mx)
             else:
-                video_timesteps = mx.full((b, num_video_tokens), sigma, dtype=dtype)
+                # Flatten video latents
+                b, c, f, h, w = video_latents.shape
+                num_video_tokens = f * h * w
+                video_flat = mx.transpose(mx.reshape(video_latents, (b, c, -1)), (0, 2, 1))
 
-            audio_timesteps = mx.full((ab, at), sigma, dtype=dtype)
+                # Flatten audio latents
+                ab, ac, at, af = audio_latents.shape
+                audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
+                audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
 
-            # Positive conditioning pass
-            video_modality_pos = Modality(
-                latent=video_flat, timesteps=video_timesteps, positions=video_positions,
-                context=video_embeddings_pos, context_mask=None, enabled=True,
-                positional_embeddings=precomputed_video_rope,
-            )
-            audio_modality_pos = Modality(
-                latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
-                context=audio_embeddings_pos, context_mask=None, enabled=True,
-                positional_embeddings=precomputed_audio_rope,
-            )
-            video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
+                # Compute timesteps
+                if denoise_mask_flat is not None:
+                    video_timesteps = sigma_mx * denoise_mask_flat
+                else:
+                    video_timesteps = mx.full((b, num_video_tokens), sigma_mx, dtype=dtype)
 
-            if use_cfg:
-                # Negative conditioning pass
-                video_modality_neg = Modality(
+                audio_timesteps = mx.full((ab, at), sigma_mx, dtype=dtype)
+
+                # Positive conditioning pass
+                video_modality_pos = Modality(
                     latent=video_flat, timesteps=video_timesteps, positions=video_positions,
-                    context=video_embeddings_neg, context_mask=None, enabled=True,
+                    context=video_embeddings_pos, context_mask=None, enabled=True,
                     positional_embeddings=precomputed_video_rope,
                 )
-                audio_modality_neg = Modality(
+                audio_modality_pos = Modality(
                     latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
-                    context=audio_embeddings_neg, context_mask=None, enabled=True,
+                    context=audio_embeddings_pos, context_mask=None, enabled=True,
                     positional_embeddings=precomputed_audio_rope,
                 )
-                video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
+                video_vel_pos, audio_vel_pos = transformer(video=video_modality_pos, audio=audio_modality_pos)
 
-                # Apply CFG
-                video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
-                audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
-            else:
-                video_velocity_flat = video_vel_pos
-                audio_velocity_flat = audio_vel_pos
+                if use_cfg:
+                    # Negative conditioning pass
+                    video_modality_neg = Modality(
+                        latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+                        context=video_embeddings_neg, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_video_rope,
+                    )
+                    audio_modality_neg = Modality(
+                        latent=audio_flat, timesteps=audio_timesteps, positions=audio_positions,
+                        context=audio_embeddings_neg, context_mask=None, enabled=True,
+                        positional_embeddings=precomputed_audio_rope,
+                    )
+                    video_vel_neg, audio_vel_neg = transformer(video=video_modality_neg, audio=audio_modality_neg)
 
-            # Reshape velocities
-            video_velocity = mx.reshape(mx.transpose(video_velocity_flat, (0, 2, 1)), (b, c, f, h, w))
-            audio_velocity = mx.reshape(audio_velocity_flat, (ab, at, ac, af))
-            audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
+                    # Apply CFG
+                    video_velocity_flat = video_vel_pos + (cfg_scale - 1.0) * (video_vel_pos - video_vel_neg)
+                    audio_velocity_flat = audio_vel_pos + (cfg_scale - 1.0) * (audio_vel_pos - audio_vel_neg)
+                else:
+                    video_velocity_flat = video_vel_pos
+                    audio_velocity_flat = audio_vel_pos
 
-            # Compute denoised
-            video_denoised = to_denoised(video_latents, video_velocity, sigma)
-            audio_denoised = to_denoised(audio_latents, audio_velocity, sigma)
+                # Reshape velocities
+                video_velocity = mx.reshape(mx.transpose(video_velocity_flat, (0, 2, 1)), (b, c, f, h, w))
+                audio_velocity = mx.reshape(audio_velocity_flat, (ab, at, ac, af))
+                audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
 
-            if video_state is not None:
-                video_denoised = apply_denoise_mask(video_denoised, video_state.clean_latent, video_state.denoise_mask)
+                # Compute denoised
+                video_denoised = to_denoised(video_latents, video_velocity, sigma_mx)
+                audio_denoised = to_denoised(audio_latents, audio_velocity, sigma_mx)
 
-            # Euler step
-            if sigma_next > 0:
-                # Compute Euler step in float32 for precision (matching PyTorch behavior)
-                sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
-                sigma_f32 = mx.array(sigma, dtype=mx.float32)
+                if video_state is not None:
+                    video_denoised = apply_denoise_mask(
+                        video_denoised, video_state.clean_latent, video_state.denoise_mask
+                    )
 
-                video_latents_f32 = video_latents.astype(mx.float32)
-                video_denoised_f32 = video_denoised.astype(mx.float32)
-                video_latents = (video_denoised_f32 + sigma_next_f32 * (video_latents_f32 - video_denoised_f32) / sigma_f32).astype(dtype)
+                # Euler step
+                if sigma_next > 0:
+                    # Compute Euler step in float32 for precision (matching PyTorch behavior)
+                    sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
+                    sigma_f32 = mx.array(sigma, dtype=mx.float32)
 
-                audio_latents_f32 = audio_latents.astype(mx.float32)
-                audio_denoised_f32 = audio_denoised.astype(mx.float32)
-                audio_latents = (audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32).astype(dtype)
-            else:
-                video_latents = video_denoised
-                audio_latents = audio_denoised
+                    video_latents_f32 = video_latents.astype(mx.float32)
+                    video_denoised_f32 = video_denoised.astype(mx.float32)
+                    video_latents = (
+                        video_denoised_f32 + sigma_next_f32 * (video_latents_f32 - video_denoised_f32) / sigma_f32
+                    ).astype(dtype)
+
+                    audio_latents_f32 = audio_latents.astype(mx.float32)
+                    audio_denoised_f32 = audio_denoised.astype(mx.float32)
+                    audio_latents = (
+                        audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32
+                    ).astype(dtype)
+                else:
+                    video_latents = video_denoised
+                    audio_latents = audio_denoised
 
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(video_latents, audio_latents)
@@ -961,6 +1256,8 @@ def generate_video(
     cache_limit_gb: Optional[float] = None,
     memory_limit_gb: Optional[float] = None,
     eval_interval: int = 1,
+    compile_step: bool = False,
+    compile_shapeless: bool = False,
     loras: Optional[list[tuple[str, float]]] = None,
     checkpoint_path: Optional[str] = None,
     auto_output_name: bool = False,
@@ -1008,6 +1305,8 @@ def generate_video(
         cache_limit_gb: Set MLX cache limit in GB
         memory_limit_gb: Set MLX memory limit in GB
         eval_interval: Evaluate latents every N steps (reduces sync overhead)
+        compile_step: Compile denoise step for repeated execution
+        compile_shapeless: Allow recompilation for varying shapes (slower, more flexible)
         loras: Optional list of (path, strength) LoRA weights to merge
         checkpoint_path: Optional explicit checkpoint .safetensors file to load
         auto_output_name: If True, auto-generate output filename from prompt
@@ -1639,6 +1938,8 @@ def generate_video(
             verbose=verbose, state=state1,
             audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
             eval_interval=eval_interval,
+            compile_step=compile_step,
+            compile_shapeless=compile_shapeless,
         )
         _log_memory("stage1 complete", mem_log)
 
@@ -1725,6 +2026,8 @@ def generate_video(
             verbose=verbose, state=state2,
             audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
             eval_interval=eval_interval,
+            compile_step=compile_step,
+            compile_shapeless=compile_shapeless,
         )
         _log_memory("stage2 complete", mem_log)
 
@@ -1819,12 +2122,16 @@ def generate_video(
                 audio_embeddings_pos, audio_embeddings_neg,
                 transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, video_state=video_state,
                 eval_interval=eval_interval,
+                compile_step=compile_step,
+                compile_shapeless=compile_shapeless,
             )
         else:
             latents = denoise_dev(
                 latents, video_positions, video_embeddings_pos, video_embeddings_neg,
                 transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, state=video_state,
                 eval_interval=eval_interval,
+                compile_step=compile_step,
+                compile_shapeless=compile_shapeless,
             )
         _log_memory("denoise complete", mem_log)
 
@@ -2209,6 +2516,11 @@ Examples:
         default=default_eval_interval,
         help="Evaluate latents every N steps (reduces sync overhead; higher uses more memory)",
     )
+    env_compile = os.getenv("LTX_COMPILE", "").lower() in ("1", "true", "yes")
+    env_compile_shapeless = os.getenv("LTX_COMPILE_SHAPELESS", "").lower() in ("1", "true", "yes")
+    parser.add_argument("--compile", action="store_true", help="Compile denoise step for faster repeated execution")
+    parser.add_argument("--compile-shapeless", action="store_true", help="Allow recompile on shape changes")
+    parser.add_argument("--no-compile", action="store_true", help="Disable compilation even if env enables it")
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Alias for --steps")
     parser.add_argument("--cfg-guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
     parser.add_argument("--guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
@@ -2231,6 +2543,14 @@ Examples:
         args.text_encoder_repo = args.gemma_root
     if args.eval_interval < 1:
         args.eval_interval = 1
+    if args.no_compile:
+        args.compile = False
+    elif env_compile:
+        args.compile = True
+    if not args.compile:
+        args.compile_shapeless = False
+    elif env_compile_shapeless:
+        args.compile_shapeless = True
 
     auto_output_name_model = None
     if args.auto_output_name:
@@ -2307,6 +2627,8 @@ Examples:
         cache_limit_gb=args.cache_limit_gb,
         memory_limit_gb=args.memory_limit_gb,
         eval_interval=args.eval_interval,
+        compile_step=args.compile,
+        compile_shapeless=args.compile_shapeless,
         loras=loras,
         checkpoint_path=args.checkpoint_path,
         auto_output_name=args.auto_output_name,
