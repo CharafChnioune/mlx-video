@@ -358,6 +358,7 @@ def denoise_distilled(
     audio_latents: Optional[mx.array] = None,
     audio_positions: Optional[mx.array] = None,
     audio_embeddings: Optional[mx.array] = None,
+    eval_interval: int = 1,
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     dtype = latents.dtype
@@ -420,9 +421,6 @@ def denoise_distilled(
                 )
 
             velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
-            mx.eval(velocity)
-            if audio_velocity is not None:
-                mx.eval(audio_velocity)
 
             velocity = mx.reshape(mx.transpose(velocity, (0, 2, 1)), (b, c, f, h, w))
             denoised = to_denoised(latents, velocity, sigma)
@@ -436,10 +434,6 @@ def denoise_distilled(
 
             if state is not None:
                 denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
-
-            mx.eval(denoised)
-            if audio_denoised is not None:
-                mx.eval(audio_denoised)
 
             if sigma_next > 0:
                 # Compute Euler step in float32 for precision (matching PyTorch behavior)
@@ -457,9 +451,11 @@ def denoise_distilled(
                 if enable_audio and audio_denoised is not None:
                     audio_latents = audio_denoised
 
-            mx.eval(latents)
-            if enable_audio:
-                mx.eval(audio_latents)
+            if (i + 1) % eval_interval == 0 or i == num_steps - 1:
+                if enable_audio:
+                    mx.eval(latents, audio_latents)
+                else:
+                    mx.eval(latents)
 
             progress.advance(task)
 
@@ -483,6 +479,7 @@ def denoise_dev(
     cfg_scale: float = 4.0,
     verbose: bool = True,
     state: Optional[LatentState] = None,
+    eval_interval: int = 1,
 ) -> mx.array:
     """Run denoising loop for dev pipeline with CFG."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -581,7 +578,8 @@ def denoise_dev(
             else:
                 latents = denoised
 
-            mx.eval(latents)
+            if (i + 1) % eval_interval == 0 or i == num_steps - 1:
+                mx.eval(latents)
             progress.advance(task)
 
     _debug_stats("latents_after_denoise_dev", latents)
@@ -602,6 +600,7 @@ def denoise_dev_av(
     cfg_scale: float = 4.0,
     verbose: bool = True,
     video_state: Optional[LatentState] = None,
+    eval_interval: int = 1,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG and audio."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -738,7 +737,8 @@ def denoise_dev_av(
                 video_latents = video_denoised
                 audio_latents = audio_denoised
 
-            mx.eval(video_latents, audio_latents)
+            if (i + 1) % eval_interval == 0 or i == num_steps - 1:
+                mx.eval(video_latents, audio_latents)
             progress.advance(task)
 
     _debug_stats("video_latents_after_denoise_dev_av", video_latents)
@@ -960,6 +960,7 @@ def generate_video(
     clear_cache: bool = False,
     cache_limit_gb: Optional[float] = None,
     memory_limit_gb: Optional[float] = None,
+    eval_interval: int = 1,
     loras: Optional[list[tuple[str, float]]] = None,
     checkpoint_path: Optional[str] = None,
     auto_output_name: bool = False,
@@ -1006,6 +1007,7 @@ def generate_video(
         clear_cache: Clear MLX cache after generation
         cache_limit_gb: Set MLX cache limit in GB
         memory_limit_gb: Set MLX memory limit in GB
+        eval_interval: Evaluate latents every N steps (reduces sync overhead)
         loras: Optional list of (path, strength) LoRA weights to merge
         checkpoint_path: Optional explicit checkpoint .safetensors file to load
         auto_output_name: If True, auto-generate output filename from prompt
@@ -1636,6 +1638,7 @@ def generate_video(
             latents, positions, text_embeddings, transformer, STAGE_1_SIGMAS,
             verbose=verbose, state=state1,
             audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
+            eval_interval=eval_interval,
         )
         _log_memory("stage1 complete", mem_log)
 
@@ -1721,6 +1724,7 @@ def generate_video(
             latents, positions, text_embeddings, transformer, STAGE_2_SIGMAS,
             verbose=verbose, state=state2,
             audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
+            eval_interval=eval_interval,
         )
         _log_memory("stage2 complete", mem_log)
 
@@ -1813,12 +1817,14 @@ def generate_video(
                 video_positions, audio_positions,
                 video_embeddings_pos, video_embeddings_neg,
                 audio_embeddings_pos, audio_embeddings_neg,
-                transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, video_state=video_state
+                transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, video_state=video_state,
+                eval_interval=eval_interval,
             )
         else:
             latents = denoise_dev(
                 latents, video_positions, video_embeddings_pos, video_embeddings_neg,
-                transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, state=video_state
+                transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, state=video_state,
+                eval_interval=eval_interval,
             )
         _log_memory("denoise complete", mem_log)
 
@@ -1968,8 +1974,6 @@ def generate_video(
             mx.eval(audio_decoder.parameters(), vocoder.parameters())
 
             mel_spectrogram = audio_decoder(audio_latents)
-            mx.eval(mel_spectrogram)
-
             audio_waveform = vocoder(mel_spectrogram)
             mx.eval(audio_waveform)
 
@@ -2198,6 +2202,13 @@ Examples:
     parser.add_argument("--clear-cache", action="store_true", help="Clear MLX cache after generation")
     parser.add_argument("--cache-limit-gb", type=float, default=None, help="Set MLX cache limit in GB")
     parser.add_argument("--memory-limit-gb", type=float, default=None, help="Set MLX memory limit in GB")
+    default_eval_interval = int(os.getenv("LTX_EVAL_INTERVAL", "1"))
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=default_eval_interval,
+        help="Evaluate latents every N steps (reduces sync overhead; higher uses more memory)",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Alias for --steps")
     parser.add_argument("--cfg-guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
     parser.add_argument("--guidance-scale", type=float, default=None, help="Alias for --cfg-scale")
@@ -2218,6 +2229,8 @@ Examples:
         args.cfg_scale = args.guidance_scale
     if args.gemma_root is not None:
         args.text_encoder_repo = args.gemma_root
+    if args.eval_interval < 1:
+        args.eval_interval = 1
 
     auto_output_name_model = None
     if args.auto_output_name:
@@ -2293,6 +2306,7 @@ Examples:
         clear_cache=args.clear_cache,
         cache_limit_gb=args.cache_limit_gb,
         memory_limit_gb=args.memory_limit_gb,
+        eval_interval=args.eval_interval,
         loras=loras,
         checkpoint_path=args.checkpoint_path,
         auto_output_name=args.auto_output_name,
