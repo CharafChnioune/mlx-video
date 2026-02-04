@@ -95,7 +95,8 @@ class VideoLatentTools(LatentTools):
             LatentState(
                 latent=initial_latent,
                 denoise_mask=denoise_mask,
-                positions=positions.astype(dtype),
+                # Keep positions in float32 to preserve RoPE precision.
+                positions=positions,
                 clean_latent=clean_latent,
             )
         )

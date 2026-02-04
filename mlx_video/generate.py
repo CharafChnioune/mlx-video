@@ -2671,7 +2671,7 @@ Examples:
     parser.add_argument("--clear-cache", action="store_true", help="Clear MLX cache after generation")
     parser.add_argument("--cache-limit-gb", type=float, default=None, help="Set MLX cache limit in GB")
     parser.add_argument("--memory-limit-gb", type=float, default=None, help="Set MLX memory limit in GB")
-    default_eval_interval = int(os.getenv("LTX_EVAL_INTERVAL", "1"))
+    default_eval_interval = int(os.getenv("LTX_EVAL_INTERVAL", "2"))
     parser.add_argument(
         "--eval-interval",
         type=int,
@@ -2681,13 +2681,17 @@ Examples:
     env_compile = os.getenv("LTX_COMPILE", "").lower() in ("1", "true", "yes")
     env_compile_shapeless = os.getenv("LTX_COMPILE_SHAPELESS", "").lower() in ("1", "true", "yes")
     env_cfg_batch = os.getenv("LTX_CFG_BATCH", "").lower() in ("1", "true", "yes")
-    parser.add_argument("--compile", action="store_true", help="Compile denoise step for faster repeated execution")
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile denoise step for faster repeated execution (auto-enabled for longer runs)",
+    )
     parser.add_argument("--compile-shapeless", action="store_true", help="Allow recompile on shape changes")
     parser.add_argument("--no-compile", action="store_true", help="Disable compilation even if env enables it")
     parser.add_argument(
         "--cfg-batch",
         action="store_true",
-        help="Batch CFG pos/neg in one forward (faster, higher memory)",
+        help="Batch CFG pos/neg in one forward (auto when cfg_scale > 1; faster, higher memory)",
     )
     parser.add_argument("--no-cfg-batch", action="store_true", help="Disable CFG batching even if env enables it")
     parser.add_argument("--metal-capture", action="store_true", help="Capture Metal GPU trace (.gputrace)")
@@ -2725,6 +2729,8 @@ Examples:
         args.compile = False
     elif env_compile:
         args.compile = True
+    elif not args.compile and args.steps >= 8:
+        args.compile = True
     if not args.compile:
         args.compile_shapeless = False
     elif env_compile_shapeless:
@@ -2732,6 +2738,8 @@ Examples:
     if args.no_cfg_batch:
         args.cfg_batch = False
     elif env_cfg_batch:
+        args.cfg_batch = True
+    elif not args.cfg_batch and args.cfg_scale > 1.0:
         args.cfg_batch = True
 
     auto_output_name_model = None
