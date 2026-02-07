@@ -100,6 +100,35 @@ def get_model_path(model_repo: str, require_files: bool = True):
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     hf_token = os.environ.get("HF_TOKEN") or None
     # Keep downloads tight: avoid grabbing unrelated (huge) files from repos like `Lightricks/LTX-2`.
+    #
+    # NOTE: Some model repos (including several community conversions) accidentally include
+    # duplicate text-encoder shards under both:
+    #   - text_encoder/diffusion_pytorch_model-*.safetensors
+    #   - text_encoder/model-*.safetensors
+    # Downloading both doubles bandwidth/disk usage (tens of GiB). We pick one.
+    text_encoder_glob = "text_encoder/*.safetensors"
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        info = api.model_info(repo_id=alias, files_metadata=False)
+        te = [
+            s.rfilename
+            for s in (getattr(info, "siblings", None) or [])
+            if s.rfilename.startswith("text_encoder/") and s.rfilename.endswith(".safetensors")
+        ]
+        has_diffusers = any(p.startswith("text_encoder/diffusion_pytorch_model") for p in te)
+        has_model = any(p.startswith("text_encoder/model") for p in te)
+        if has_diffusers:
+            text_encoder_glob = "text_encoder/diffusion_pytorch_model*.safetensors"
+            if has_model:
+                print("[mlx-video] Text encoder repo contains duplicate shard sets; downloading only diffusion_pytorch_model*.safetensors")
+        elif has_model:
+            text_encoder_glob = "text_encoder/model*.safetensors"
+    except Exception:
+        # Best-effort only. We'll fall back to downloading any safetensors under text_encoder/.
+        pass
+
     allow_patterns = [
         # Model weights. Different repos use different conventions.
         "model.safetensors",
@@ -111,7 +140,11 @@ def get_model_path(model_repo: str, require_files: bool = True):
         "vocoder/*",
         "connectors/*",
         "latent_upsampler/*",
-        "text_encoder/*",
+        # Text encoder: download only one shard set (see `text_encoder_glob` selection above).
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "text_encoder/*.index.json",
+        text_encoder_glob,
         "tokenizer/*",
         "scheduler/*",
     ]
@@ -130,7 +163,8 @@ def get_model_path(model_repo: str, require_files: bool = True):
             dry_run=True,
         )
         if isinstance(plan, list):
-            total_bytes = sum(getattr(f, "size", 0) or 0 for f in plan)
+            # `snapshot_download(dry_run=True)` returns `DryRunFileInfo` objects.
+            total_bytes = sum(getattr(f, "file_size", 0) or 0 for f in plan)
             print(f"Download plan: {len(plan)} files, {total_bytes / (1024**3):.2f} GiB")
     except Exception as e:
         print(f"Download plan unavailable: {e}")
