@@ -91,26 +91,45 @@ def get_model_path(model_repo: str, require_files: bool = True):
     # mode it can improve throughput for large model snapshots. Users can override in ENVIRONMENT.
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     hf_token = os.environ.get("HF_TOKEN") or None
+    allow_patterns = [
+        "*.safetensors",
+        "*.json",
+        "vae/*",
+        "audio_vae/*",
+        "vocoder/*",
+        "connectors/*",
+        "text_encoder/*",
+        "tokenizer/*",
+        "scheduler/*",
+    ]
+
+    max_workers = int(os.environ.get("HF_HUB_MAX_WORKERS", "8"))
+
+    # Print a quick plan so it doesn't look "stuck" before the first bytes arrive.
+    try:
+        plan = snapshot_download(
+            repo_id=alias,
+            local_files_only=False,
+            token=hf_token,
+            max_workers=max_workers,
+            tqdm_class=_PinokioTqdm,
+            allow_patterns=allow_patterns,
+            dry_run=True,
+        )
+        if isinstance(plan, list):
+            total_bytes = sum(getattr(f, "size", 0) or 0 for f in plan)
+            print(f"Download plan: {len(plan)} files, {total_bytes / (1024**3):.2f} GiB")
+    except Exception as e:
+        print(f"Download plan unavailable: {e}")
+
     downloaded = Path(
         snapshot_download(
             repo_id=alias,
             local_files_only=False,
             token=hf_token,
-            # More workers can speed up repos with many files; for big safetensors it
-            # won't hurt, but keep it reasonable to avoid rate limiting.
-            max_workers=int(os.environ.get("HF_HUB_MAX_WORKERS", "8")),
+            max_workers=max_workers,
             tqdm_class=_PinokioTqdm,
-            allow_patterns=[
-                "*.safetensors",
-                "*.json",
-                "vae/*",
-                "audio_vae/*",
-                "vocoder/*",
-                "connectors/*",
-                "text_encoder/*",
-                "tokenizer/*",
-                "scheduler/*",
-            ],
+            allow_patterns=allow_patterns,
         )
     )
     if require_files and (not _has_required_files(downloaded)):
