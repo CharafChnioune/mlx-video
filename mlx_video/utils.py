@@ -101,7 +101,10 @@ def get_model_path(model_repo: str, require_files: bool = True):
     hf_token = os.environ.get("HF_TOKEN") or None
     # Keep downloads tight: avoid grabbing unrelated (huge) files from repos like `Lightricks/LTX-2`.
     allow_patterns = [
+        # Model weights. Different repos use different conventions.
+        "model.safetensors",
         "ltx-2-*.safetensors",
+        "ltx2-*.safetensors",
         "*.json",
         "vae/*",
         "audio_vae/*",
