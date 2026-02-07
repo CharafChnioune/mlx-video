@@ -790,6 +790,8 @@ def denoise_distilled(
                     mx.eval(latents)
 
             progress.advance(task)
+            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
+                print(f"Denoising {i + 1}/{num_steps}", flush=True)
 
     _debug_stats("latents_after_denoise_distilled", latents)
     if enable_audio:
@@ -931,6 +933,8 @@ def denoise_audio_only(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(audio_latents)
             progress.advance(task)
+            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
+                print(f"Denoising audio {i + 1}/{num_steps}", flush=True)
 
     _debug_stats("audio_latents_after_denoise_audio_only", audio_latents)
     return audio_latents
@@ -1172,6 +1176,8 @@ def denoise_dev(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(latents)
             progress.advance(task)
+            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
+                print(f"Denoising {i + 1}/{num_steps}", flush=True)
 
     _debug_stats("latents_after_denoise_dev", latents)
     return latents
@@ -1510,6 +1516,8 @@ def denoise_dev_av(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(video_latents, audio_latents)
             progress.advance(task)
+            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
+                print(f"Denoising {i + 1}/{num_steps}", flush=True)
 
     _debug_stats("video_latents_after_denoise_dev_av", video_latents)
     _debug_stats("audio_latents_after_denoise_dev_av", audio_latents)
@@ -3016,6 +3024,12 @@ def generate_video(
         preview_max_dim = int(os.environ.get("MLX_VIDEO_PREVIEW_MAX_DIM", "512"))
         preview_quality = int(os.environ.get("MLX_VIDEO_PREVIEW_QUALITY", "85"))
         last_preview_idx = -1
+        progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
+        try:
+            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", str(preview_every)))
+        except Exception:
+            progress_echo_every = preview_every
+        last_progress_idx = -1
         preview_pil = None
         if preview_path is not None:
             try:
@@ -3026,6 +3040,7 @@ def generate_video(
                 preview_path = None
 
         def on_frames_ready(frames: mx.array, _start_idx: int):
+            nonlocal last_preview_idx, last_progress_idx
             frames = mx.squeeze(frames, axis=0)
             frames = mx.transpose(frames, (1, 2, 3, 0))
             frames = mx.clip((frames + 1.0) / 2.0, 0.0, 1.0)
@@ -3040,6 +3055,14 @@ def generate_video(
                     video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                     if stream_progress is not None and stream_task is not None:
                         stream_progress.advance(stream_task)
+                    if progress_echo and progress_echo_every > 0:
+                        idx = _start_idx + i
+                        if idx == 0 or idx == num_frames - 1 or (idx - last_progress_idx) >= progress_echo_every:
+                            try:
+                                print(f"Streaming frames {idx + 1}/{num_frames}", flush=True)
+                                last_progress_idx = idx
+                            except Exception:
+                                pass
                     if preview_path is not None and preview_pil is not None and preview_every > 0:
                         idx = _start_idx + i
                         if idx == 0 or (idx - last_preview_idx) >= preview_every:
