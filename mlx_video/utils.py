@@ -46,6 +46,10 @@ class _PinokioTqdm(_tqdm):
     """
 
     def __init__(self, *args, **kwargs):
+        # Hugging Face Hub may pass extra metadata fields that stock tqdm does not accept.
+        # Example: `name="huggingface_hub.snapshot_download"` (introduced in newer hub versions).
+        kwargs.pop("name", None)
+
         # Allow users to turn this off if they prefer clean logs.
         if os.environ.get("LTX_NO_DOWNLOAD_PROGRESS") == "1":
             kwargs["disable"] = True
