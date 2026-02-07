@@ -1910,6 +1910,10 @@ def generate_video(
         auto_output_name: If True, auto-generate output filename from prompt
         output_name_model: Optional model repo for filename generation
     """
+    # Track stage-specific compile behavior for profiling/debugging.
+    stage1_compile_effective: Optional[bool] = None
+    stage2_compile_effective: Optional[bool] = None
+
     start_time = time.time()
     phase_timer = _PhaseTimer(profile)
     if video_encoder not in ("cv2", "ffmpeg"):
@@ -2618,12 +2622,13 @@ def generate_video(
             _debug_stats("audio_latents_stage1_initial", audio_latents)
 
         with phase_timer.phase("stage1_denoise"):
+            stage1_compile_effective = bool(compile_step)
             latents, audio_latents = denoise_distilled(
                 latents, positions, text_embeddings, transformer, stage1_sigmas_list,
                 verbose=verbose, state=state1,
                 audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
                 eval_interval=eval_interval,
-                compile_step=compile_step,
+                compile_step=stage1_compile_effective,
                 compile_shapeless=compile_shapeless,
                 fp32_euler=fp32_euler,
             )
@@ -2654,6 +2659,7 @@ def generate_video(
         console.print(f"\n[bold yellow]⚡ Stage 2:[/] Refining at {width}x{height} ({stage2_steps} steps)")
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
+        stage2_compile_effective = bool(compile_step)
 
         if stage2_model_repo and distilled_loras:
             raise ValueError("--stage2-model-repo cannot be combined with --distilled-lora (stage-2 LoRA).")
@@ -2761,7 +2767,7 @@ def generate_video(
                         audio_embeddings_pos, audio_embeddings_neg,
                         transformer, sigmas_stage2, cfg_scale=cfg_scale, verbose=verbose, video_state=state2,
                         eval_interval=eval_interval,
-                        compile_step=compile_step,
+                        compile_step=stage2_compile_effective,
                         compile_shapeless=compile_shapeless,
                         cfg_batch=cfg_batch,
                     )
@@ -2770,7 +2776,7 @@ def generate_video(
                         latents, positions, video_embeddings_pos, video_embeddings_neg,
                         transformer, sigmas_stage2, cfg_scale=cfg_scale, verbose=verbose, state=state2,
                         eval_interval=eval_interval,
-                        compile_step=compile_step,
+                        compile_step=stage2_compile_effective,
                         compile_shapeless=compile_shapeless,
                         cfg_batch=cfg_batch,
                     )
@@ -2780,7 +2786,7 @@ def generate_video(
                     verbose=verbose, state=state2,
                     audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
                     eval_interval=eval_interval,
-                    compile_step=compile_step,
+                    compile_step=stage2_compile_effective,
                     compile_shapeless=compile_shapeless,
                     fp32_euler=fp32_euler,
                 )
@@ -3287,6 +3293,8 @@ def generate_video(
                 "stage2_steps": int(stage2_steps) if is_distilled_pipeline else None,
                 "eval_interval": int(eval_interval),
                 "compile_step": bool(compile_step),
+                "compile_step_stage1": stage1_compile_effective,
+                "compile_step_stage2": stage2_compile_effective,
                 "compile_shapeless": bool(compile_shapeless),
                 "fp32_euler": bool(fp32_euler),
                 "audio": bool(audio),
@@ -3603,8 +3611,8 @@ Examples:
     is_dev_cli_pipeline = args.pipeline == "dev"
     if args.stage1_steps is None:
         # The distilled schedule contains redundant high-sigma steps; with farthest
-        # subsampling, 6 steps is typically indistinguishable from 8 but faster.
-        args.stage1_steps = 6 if args.pipeline == "distilled" else 8
+        # subsampling, 5 steps is typically very close to 6/8 but faster.
+        args.stage1_steps = 5 if args.pipeline == "distilled" else 8
     if args.stage2_steps is None:
         # Default: prefer speed for plain distilled runs; keep historical default
         # (3 steps) for the other two-stage pipelines.
