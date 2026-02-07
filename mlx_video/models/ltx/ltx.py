@@ -540,41 +540,75 @@ class LTXModel(nn.Module):
         strict: bool = True,
         weights_override: dict | None = None,
     ) -> None:
+        from safetensors import safe_open
+
         model = cls(config)
 
-        weights = {}
         model_path_list = model_path if isinstance(model_path, list) else [model_path]
+        def _sanitize_key(key: str) -> str | None:
+            # Match `sanitize()` but only for the key mapping.
+            if (
+                (not key.startswith("model.diffusion_model."))
+                or ("audio_embeddings_connector" in key)
+                or ("video_embeddings_connector" in key)
+            ):
+                return None
+            new_key = key.replace("model.diffusion_model.", "")
+            new_key = new_key.replace(".to_out.0.", ".to_out.")
+            new_key = new_key.replace(".ff.net.0.proj.", ".ff.proj_in.")
+            new_key = new_key.replace(".ff.net.2.", ".ff.proj_out.")
+            new_key = new_key.replace(".audio_ff.net.0.proj.", ".audio_ff.proj_in.")
+            new_key = new_key.replace(".audio_ff.net.2.", ".audio_ff.proj_out.")
+            new_key = new_key.replace(".linear_1.", ".linear1.")
+            new_key = new_key.replace(".linear_2.", ".linear2.")
+            return new_key
+
+        def _scan_keys(paths: list[Path]) -> set[str]:
+            keys: set[str] = set()
+            for p in paths:
+                try:
+                    with safe_open(str(p), framework="numpy") as f:
+                        keys.update(f.keys())
+                except Exception:
+                    # Best-effort fallback: if this isn't a safetensors file, we cannot cheaply scan keys.
+                    pass
+            return keys
+
+        def _maybe_cast(key: str, value: mx.array, has_quant: bool) -> mx.array:
+            if not hasattr(value, "dtype") or value.dtype != mx.float32:
+                return value
+            if has_quant and (key.endswith(".scales") or key.endswith(".biases")):
+                return value
+            return value.astype(mx.bfloat16)
+
+        # Determine format/quantization without loading full tensors into a single dict.
         if weights_override is not None:
+            # This path is used for unified weights or LoRA-merges, where tensors are already in memory.
             weights = dict(weights_override)
+            is_pytorch = any(k.startswith("model.diffusion_model.") for k in weights)
+            sanitized = model.sanitize(weights) if is_pytorch else weights
+            has_quant = any(k.endswith(".scales") or k.endswith(".biases") for k in sanitized)
+            scales_keys = {k for k in sanitized if k.endswith(".scales")}
         else:
-            for weight_file in model_path_list:
-                weights.update(mx.load(str(weight_file)))
+            raw_keys = _scan_keys([Path(p) for p in model_path_list])
+            is_pytorch = any(k.startswith("model.diffusion_model.") for k in raw_keys)
+            if is_pytorch:
+                mapped = [_sanitize_key(k) for k in raw_keys]
+                mapped_keys = [k for k in mapped if k]
+                has_quant = any(k.endswith(".scales") or k.endswith(".biases") for k in mapped_keys)
+                scales_keys = {k for k in mapped_keys if k.endswith(".scales")}
+            else:
+                has_quant = any(k.endswith(".scales") or k.endswith(".biases") for k in raw_keys)
+                scales_keys = {k for k in raw_keys if k.endswith(".scales")}
 
         if _debug_enabled():
-            total = len(weights)
-            scales = sum(1 for k in weights if k.endswith(".scales"))
-            biases = sum(1 for k in weights if k.endswith(".biases"))
-            dtypes = {}
-            for v in weights.values():
-                key = str(v.dtype)
-                dtypes[key] = dtypes.get(key, 0) + 1
             _debug_log(
                 f"from_pretrained files={[str(p) for p in model_path_list]} "
-                f"keys={total} scales={scales} biases={biases} dtypes={dtypes}"
+                f"is_pytorch={is_pytorch} has_quant={has_quant} strict={strict} "
+                f"scales_keys={len(scales_keys)}"
             )
 
-        # Detect PyTorch vs MLX weight format
-        is_pytorch = any(k.startswith("model.diffusion_model.") for k in weights)
-        if is_pytorch:
-            sanitized = model.sanitize(weights)
-        else:
-            sanitized = weights
-
-        if _debug_enabled():
-            _debug_log(f"is_pytorch={is_pytorch} strict={strict}")
-
-        # If quantized weights are present, configure quantization before loading
-        has_quant = any(k.endswith(".scales") or k.endswith(".biases") for k in sanitized)
+        # If quantized weights are present, configure quantization before loading.
         if has_quant:
             # Default quant settings; override if quantization.json exists
             group_size = 64
@@ -625,7 +659,7 @@ class LTXModel(nn.Module):
                 return False
 
             def _scales_predicate(p, m):
-                return f"{p}.scales" in sanitized
+                return f"{p}.scales" in scales_keys
 
             # When loading already-quantized weights, rely on the saved .scales
             # tensors to decide which modules to quantize. This avoids mismatches
@@ -651,15 +685,32 @@ class LTXModel(nn.Module):
                 q_modules = sum(1 for _, m in model.named_modules() if hasattr(m, "scales"))
                 _debug_log(f"quantized modules={q_modules}")
 
-            # For quantized weights, keep scale/bias dtype as saved, cast others to bfloat16
+        if weights_override is not None:
+            # Cast in-memory overrides (used for LoRA merges) without duplicating scale/bias dtypes.
             sanitized = {
-                k: (v.astype(mx.bfloat16) if v.dtype == mx.float32 else v)
+                k: _maybe_cast(k, v, has_quant)
                 for k, v in sanitized.items()
             }
+            model.load_weights(list(sanitized.items()), strict=strict)
         else:
-            sanitized = {k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v for k, v in sanitized.items()}
+            # Stream-load shards to reduce peak memory: do not aggregate into a huge dict first.
+            for weight_file in model_path_list:
+                shard = mx.load(str(weight_file))
+                items = []
+                if is_pytorch:
+                    for k, v in shard.items():
+                        kk = _sanitize_key(k)
+                        if kk is None:
+                            continue
+                        items.append((kk, _maybe_cast(kk, v, has_quant)))
+                else:
+                    for k, v in shard.items():
+                        items.append((k, _maybe_cast(k, v, has_quant)))
+                if items:
+                    model.load_weights(items, strict=strict)
+                del shard
+                mx.clear_cache()
 
-        model.load_weights(list(sanitized.items()), strict=strict)
         mx.eval(model.parameters())
         model.eval()
         return model

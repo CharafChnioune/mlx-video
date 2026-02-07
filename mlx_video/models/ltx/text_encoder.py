@@ -182,6 +182,8 @@ class LanguageModel(nn.Module):
     @classmethod
     def from_pretrained(cls, model_path: str):
         import json
+        from safetensors import safe_open
+
         path = Path(model_path)
         config_file = path / "config.json"
 
@@ -212,18 +214,39 @@ class LanguageModel(nn.Module):
             raise ValueError(f"Config file not found at {model_path}")
 
         quantization = config_dict.get("quantization", None)
-        weights = {}
-        for i, wf in enumerate(weight_files):
-            weights.update(mx.load(str(wf)))
+        # Reduce peak memory by avoiding a "load all shards into a single dict" pattern.
+        # We scan safetensors headers for quantization keys first, then load/apply shards one by one.
+        scales_keys = set()
+        if quantization is not None:
+            prefix = "language_model."
+            for wf in weight_files:
+                with safe_open(str(wf), framework="numpy") as f:
+                    for k in f.keys():
+                        if not k.startswith(prefix):
+                            continue
+                        kk = k[len(prefix) :]
+                        if kk.endswith(".scales"):
+                            scales_keys.add(kk)
 
+            # `apply_quantization` only needs membership tests (`f\"{p}.scales\" in weights`),
+            # so passing a set keeps this cheap and avoids loading tensors eagerly.
+            apply_quantization(model=language_model, weights=scales_keys, quantization=quantization)
 
-        if hasattr(language_model, "sanitize"):
-            weights = language_model.sanitize(weights=weights)
-
-
-        apply_quantization(model=language_model, weights=weights, quantization=quantization)
-
-        language_model.load_weights(list(weights.items()), strict=False)
+        prefix = "language_model."
+        for wf in weight_files:
+            shard = mx.load(str(wf))
+            items = []
+            for k, v in shard.items():
+                if not k.startswith(prefix):
+                    continue
+                kk = k[len(prefix) :]
+                if hasattr(v, "dtype") and v.dtype == mx.float32:
+                    v = v.astype(mx.bfloat16)
+                items.append((kk, v))
+            if items:
+                language_model.load_weights(items, strict=False)
+            del shard
+            mx.clear_cache()
 
         return language_model
 

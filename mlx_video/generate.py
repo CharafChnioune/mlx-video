@@ -2380,8 +2380,23 @@ def generate_video(
                 transformer_weights = None
         if lora_list:
             from mlx_video.lora import LoraSpec, apply_lora_to_weights, has_quantized_weights
-            raw_weights = transformer_weights if transformer_weights is not None else mx.load(str(transformer_weight_path))
-            if has_quantized_weights(raw_weights):
+            # Avoid loading huge quantized safetensors just to detect quantization.
+            # For file-based weights, scan the safetensors header for `.scales`/`.biases` keys.
+            is_quantized = False
+            if transformer_weights is not None:
+                is_quantized = has_quantized_weights(transformer_weights)
+            else:
+                try:
+                    from safetensors import safe_open
+                    with safe_open(str(transformer_weight_path), framework="numpy") as f:
+                        is_quantized = any(
+                            k.endswith(".scales") or k.endswith(".biases") for k in f.keys()
+                        )
+                except Exception:
+                    # Fallback to the old behavior (may be memory-heavy).
+                    is_quantized = has_quantized_weights(mx.load(str(transformer_weight_path)))
+
+            if is_quantized:
                 # Quantized weights + per-run LoRA: re-quantize in-memory using float weights
                 float_weight_path = model_path / weight_file
                 if not float_weight_path.exists():
@@ -2476,6 +2491,7 @@ def generate_video(
                     class_predicate=pred,
                 )
             else:
+                raw_weights = transformer_weights if transformer_weights is not None else mx.load(str(transformer_weight_path))
                 lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
                 weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
         elif transformer_weights is not None:
