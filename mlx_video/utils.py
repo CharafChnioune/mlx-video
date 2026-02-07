@@ -82,8 +82,12 @@ def get_model_path(model_repo: str, require_files: bool = True):
         if require_files and not _has_required_files(local):
             local = None
         if local is not None and _needs_connectors(alias):
-            connector_file = local / "connectors" / "ltx_text_connectors.safetensors"
-            if not connector_file.exists():
+            # Some MLX snapshots ship connectors under different filenames.
+            connector_candidates = [
+                local / "connectors" / "ltx_text_connectors.safetensors",
+                local / "connectors" / "diffusion_pytorch_model.safetensors",
+            ]
+            if not any(p.exists() for p in connector_candidates):
                 local = None
         if local is not None:
             return local
@@ -95,13 +99,15 @@ def get_model_path(model_repo: str, require_files: bool = True):
     # mode it can improve throughput for large model snapshots. Users can override in ENVIRONMENT.
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     hf_token = os.environ.get("HF_TOKEN") or None
+    # Keep downloads tight: avoid grabbing unrelated (huge) files from repos like `Lightricks/LTX-2`.
     allow_patterns = [
-        "*.safetensors",
+        "ltx-2-*.safetensors",
         "*.json",
         "vae/*",
         "audio_vae/*",
         "vocoder/*",
         "connectors/*",
+        "latent_upsampler/*",
         "text_encoder/*",
         "tokenizer/*",
         "scheduler/*",

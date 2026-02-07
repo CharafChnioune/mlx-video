@@ -733,7 +733,26 @@ class LTX2TextEncoder(nn.Module):
                     connector_weights[new_key] = value
 
             # If connector weights are missing (e.g. quantized-only transformer file),
-            # fall back to base LTX-2 weights for connector extraction.
+            # prefer the dedicated connector safetensors shipped in many MLX snapshots.
+            if not connector_weights:
+                alt_connector_file = model_path / "connectors" / "diffusion_pytorch_model.safetensors"
+                if alt_connector_file.exists():
+                    print(f"[TextEncoder] Using connector weights from {alt_connector_file}")
+                    alt_weights = mx.load(str(alt_connector_file))
+
+                    # Feature extractor projection (matches GemmaFeaturesExtractor.aggregate_embed shape).
+                    if "text_proj_in.weight" in alt_weights:
+                        self.feature_extractor.aggregate_embed.weight = alt_weights["text_proj_in.weight"]
+
+                    for key, value in alt_weights.items():
+                        if key.startswith("video_connector."):
+                            new_key = key.replace("video_connector.", "")
+                            connector_weights[new_key] = value
+
+                    # Reuse for audio connector extraction below.
+                    transformer_weights = alt_weights
+
+            # If connector weights are still missing, fall back to base LTX-2 weights for connector extraction.
             if not connector_weights:
                 try:
                     from mlx_video.utils import get_model_path
@@ -785,6 +804,9 @@ class LTX2TextEncoder(nn.Module):
                     audio_connector_weights[new_key] = value
                 elif key.startswith("connector.audio_embeddings_connector."):
                     new_key = key.replace("connector.audio_embeddings_connector.", "")
+                    audio_connector_weights[new_key] = value
+                elif key.startswith("audio_connector."):
+                    new_key = key.replace("audio_connector.", "")
                     audio_connector_weights[new_key] = value
 
             if audio_connector_weights:
