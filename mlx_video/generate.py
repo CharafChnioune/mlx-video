@@ -3007,6 +3007,24 @@ def generate_video(
             stream_progress.start()
             stream_task = stream_progress.add_task("[cyan]Streaming frames[/]", total=num_frames)
 
+        # Optional live preview image written during streaming decode.
+        # The temp MP4 may not be playable until finalized (moov atom), so we emit a
+        # periodically-updated JPEG that the UI can poll while generation is running.
+        preview_path_env = os.environ.get("MLX_VIDEO_PREVIEW_PATH")
+        preview_path = Path(preview_path_env).expanduser() if preview_path_env else None
+        preview_every = int(os.environ.get("MLX_VIDEO_PREVIEW_EVERY", "12"))
+        preview_max_dim = int(os.environ.get("MLX_VIDEO_PREVIEW_MAX_DIM", "512"))
+        preview_quality = int(os.environ.get("MLX_VIDEO_PREVIEW_QUALITY", "85"))
+        last_preview_idx = -1
+        preview_pil = None
+        if preview_path is not None:
+            try:
+                from PIL import Image as _PILImage
+                preview_pil = _PILImage
+                preview_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                preview_path = None
+
         def on_frames_ready(frames: mx.array, _start_idx: int):
             frames = mx.squeeze(frames, axis=0)
             frames = mx.transpose(frames, (1, 2, 3, 0))
@@ -3018,10 +3036,23 @@ def generate_video(
                 if crop_params is not None:
                     top, left, out_h, out_w = crop_params
                     frames_np = frames_np[:, top : top + out_h, left : left + out_w, :]
-                for frame in frames_np:
+                for i, frame in enumerate(frames_np):
                     video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                     if stream_progress is not None and stream_task is not None:
                         stream_progress.advance(stream_task)
+                    if preview_path is not None and preview_pil is not None and preview_every > 0:
+                        idx = _start_idx + i
+                        if idx == 0 or (idx - last_preview_idx) >= preview_every:
+                            try:
+                                img = preview_pil.fromarray(frame)
+                                if preview_max_dim > 0:
+                                    img.thumbnail((preview_max_dim, preview_max_dim), resample=preview_pil.BILINEAR)
+                                tmp = preview_path.with_suffix(preview_path.suffix + ".tmp")
+                                img.save(str(tmp), format="JPEG", quality=preview_quality, optimize=True)
+                                os.replace(str(tmp), str(preview_path))
+                                last_preview_idx = idx
+                            except Exception:
+                                pass
     else:
         on_frames_ready = None
 
