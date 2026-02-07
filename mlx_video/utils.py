@@ -9,6 +9,8 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from PIL import Image
 import cv2
+import os
+from tqdm.auto import tqdm as _tqdm
 
 MODEL_REPO_ALIASES = {
     "ltx2-dev-8bit-mlx": "AITRADER/ltx2-dev-8bit-mlx",
@@ -35,6 +37,25 @@ def _has_required_files(path: Path) -> bool:
 
 def _needs_connectors(repo_id: str) -> bool:
     return str(repo_id).startswith("AITRADER/ltx2-")
+
+class _PinokioTqdm(_tqdm):
+    """Progress bar that remains visible even when stdout isn't a TTY.
+
+    Pinokio logs are not a TTY, so the default behavior can look "stuck" while large
+    weights download. This forces progress to show unless explicitly disabled.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Allow users to turn this off if they prefer clean logs.
+        if os.environ.get("LTX_NO_DOWNLOAD_PROGRESS") == "1":
+            kwargs["disable"] = True
+        else:
+            # Override any auto-disable coming from HF defaults (no TTY / env).
+            kwargs["disable"] = False
+            kwargs.setdefault("dynamic_ncols", True)
+            kwargs.setdefault("mininterval", 2.0)
+            kwargs.setdefault("ascii", True)
+        super().__init__(*args, **kwargs)
 
 
 def get_model_path(model_repo: str, require_files: bool = True):
@@ -66,11 +87,19 @@ def get_model_path(model_repo: str, require_files: bool = True):
         local = None
 
     print("Downloading LTX-2 model weights...")
+    # Hugging Face Hub now uses `hf-xet` under the hood for fast transfers. In "high performance"
+    # mode it can improve throughput for large model snapshots. Users can override in ENVIRONMENT.
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    hf_token = os.environ.get("HF_TOKEN") or None
     downloaded = Path(
         snapshot_download(
             repo_id=alias,
             local_files_only=False,
-            resume_download=True,
+            token=hf_token,
+            # More workers can speed up repos with many files; for big safetensors it
+            # won't hurt, but keep it reasonable to avoid rate limiting.
+            max_workers=int(os.environ.get("HF_HUB_MAX_WORKERS", "8")),
+            tqdm_class=_PinokioTqdm,
             allow_patterns=[
                 "*.safetensors",
                 "*.json",
