@@ -8,3 +8,4 @@ logs/
 scripts/run_lora_quant_hq.sh
 scripts/run_lora_quant_hq.local.sh
 checkpoints/
+output.mp4

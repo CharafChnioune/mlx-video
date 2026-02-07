@@ -8,6 +8,8 @@ import os
 import re
 import math
 import time
+import shutil
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
@@ -22,6 +24,39 @@ from rich.panel import Panel
 
 # Rich console for styled output
 console = Console()
+
+
+class _PhaseTimer:
+    """Lightweight phase timer for profiling end-to-end generation."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.times_s: dict[str, float] = {}
+
+    @contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.times_s[name] = self.times_s.get(name, 0.0) + (time.perf_counter() - t0)
+
+    def render(self, elapsed_s: float) -> str:
+        if not self.times_s:
+            return ""
+        total = sum(self.times_s.values())
+        denom = total if total > 0 else elapsed_s if elapsed_s > 0 else 1.0
+        rows = sorted(self.times_s.items(), key=lambda kv: kv[1], reverse=True)
+        lines = []
+        for name, dt in rows:
+            pct = 100.0 * (dt / denom)
+            lines.append(f"{name:>18}: {dt:6.2f}s ({pct:5.1f}%)")
+        lines.append(f"{'total(phases)':>18}: {total:6.2f}s")
+        lines.append(f"{'elapsed(wall)':>18}: {elapsed_s:6.2f}s")
+        return "\n".join(lines)
 
 
 def _debug_enabled() -> bool:
@@ -75,6 +110,121 @@ def _debug_weights_summary(label: str, weights_path: Optional[Path]) -> None:
         _debug_log(f"{label}: {weights_path} keys={total} scales={scales} biases={biases} dtypes={dtypes}")
     except Exception as exc:
         _debug_log(f"{label}: <failed to load> {exc}")
+
+
+def _looks_like_metal_oom(exc: BaseException) -> bool:
+    """Best-effort detection of Metal OOM/resource exhaustion errors."""
+    msg = str(exc)
+    needles = (
+        "out of memory",
+        "Out of memory",
+        "OOM",
+        "failed to allocate",
+        "kIOGPU",
+        "Command buffer execution failed",
+        "Invalid Resource",
+        "MTLCommandBufferError",
+        "[METAL]",
+    )
+    return any(n in msg for n in needles)
+
+
+def _subsample_sigmas_farthest(sigmas: list[float], steps: int) -> list[float]:
+    """Subsample a fixed sigma schedule to `steps` denoise steps.
+
+    The distilled schedules include several near-identical high-sigma entries.
+    When reducing step counts, selecting indices uniformly can over-sample that
+    region and drop useful mid/low-sigma points. This routine picks a diverse
+    subset in log-sigma space (farthest-point sampling) to preserve quality at
+    lower step counts.
+
+    Always includes the first and last sigmas.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    max_steps = len(sigmas) - 1
+    if steps >= max_steps:
+        return sigmas
+    if steps == 1:
+        return [sigmas[0], sigmas[-1]]
+
+    # Avoid log(0) by selecting among non-zero sigmas and always appending the
+    # final 0.0 endpoint.
+    eps = 1e-6
+    pool = sigmas[:-1]
+    xs = [math.log(max(s, eps)) for s in pool]
+    chosen = {0, len(pool) - 1}
+    while len(chosen) < steps:
+        best_i = None
+        best_score = -1.0
+        for i in range(len(pool)):
+            if i in chosen:
+                continue
+            score = min(abs(xs[i] - xs[j]) for j in chosen)
+            if score > best_score:
+                best_score = score
+                best_i = i
+        assert best_i is not None
+        chosen.add(best_i)
+
+    idxs = sorted(chosen)
+    return [sigmas[i] for i in idxs] + [sigmas[-1]]
+
+
+def _subsample_sigmas_uniform(sigmas: list[float], steps: int) -> list[float]:
+    """Uniformly subsample a fixed sigma schedule to `steps` denoise steps.
+
+    Always includes the first and last sigmas.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    max_steps = len(sigmas) - 1
+    if steps >= max_steps:
+        return sigmas
+    if steps == 1:
+        return [sigmas[0], sigmas[-1]]
+
+    pool = sigmas[:-1]
+    last = len(pool) - 1
+    idxs: list[int] = [0]
+    for i in range(1, steps - 1):
+        idxs.append(int(round(i * last / (steps - 1))))
+    idxs.append(last)
+
+    # Round+int can create duplicates for small schedules; fill missing indices.
+    uniq = sorted(set(idxs))
+    if len(uniq) < steps:
+        for i in range(last + 1):
+            if i in uniq:
+                continue
+            uniq.append(i)
+            if len(uniq) == steps:
+                break
+        uniq = sorted(uniq)
+
+    return [pool[i] for i in uniq] + [sigmas[-1]]
+
+
+def _subsample_sigmas(sigmas: list[float], steps: int, method: str) -> list[float]:
+    if method == "uniform":
+        return _subsample_sigmas_uniform(sigmas, steps)
+    if method == "farthest":
+        return _subsample_sigmas_farthest(sigmas, steps)
+    raise ValueError(f"Unknown sigma subsample method: {method}")
+
+
+def _subsample_refinement_sigmas(sigmas: list[float], steps: int, method: str) -> list[float]:
+    """Subsample sigma schedules for refinement passes.
+
+    For the stage-2 refinement schedule, a single denoise step is most useful at
+    low sigma (i.e., close to clean) because the model has only one chance to
+    add details. Starting from very high sigma injects a lot of noise and can
+    wash out the stage-1 structure when `steps=1`.
+    """
+    if steps == 1 and method == "farthest" and len(sigmas) >= 3:
+        # Pick the last non-zero sigma as the starting point.
+        return [sigmas[-2], sigmas[-1]]
+    return _subsample_sigmas(sigmas, steps, method)
 
 from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType, LTXRopeType
 from mlx_video.models.ltx.ltx import LTXModel
@@ -375,8 +525,11 @@ def denoise_distilled(
     eval_interval: int = 1,
     compile_step: bool = False,
     compile_shapeless: bool = False,
+    fp32_euler: bool = True,
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
+    from mlx_video.models.ltx.rope import precompute_freqs_cis
+
     dtype = latents.dtype
     enable_audio = audio_latents is not None
 
@@ -406,6 +559,35 @@ def denoise_distilled(
         ab, ac, at, af = audio_latents.shape
         audio_timesteps_mask = mx.ones((ab, at), dtype=dtype)
 
+    # Precompute RoPE once (distilled path previously recomputed this inside the model per step).
+    precomputed_video_rope = precompute_freqs_cis(
+        positions,
+        dim=transformer.inner_dim,
+        theta=transformer.positional_embedding_theta,
+        max_pos=transformer.positional_embedding_max_pos,
+        use_middle_indices_grid=transformer.use_middle_indices_grid,
+        num_attention_heads=transformer.num_attention_heads,
+        rope_type=transformer.rope_type,
+        double_precision=transformer.config.double_precision_rope,
+    )
+    precomputed_audio_rope = None
+    if enable_audio:
+        if audio_positions is None or audio_embeddings is None:
+            raise ValueError("audio_positions/audio_embeddings must be provided when audio_latents is enabled")
+        precomputed_audio_rope = precompute_freqs_cis(
+            audio_positions,
+            dim=transformer.audio_inner_dim,
+            theta=transformer.positional_embedding_theta,
+            max_pos=transformer.audio_positional_embedding_max_pos,
+            use_middle_indices_grid=transformer.use_middle_indices_grid,
+            num_attention_heads=transformer.audio_num_attention_heads,
+            rope_type=transformer.rope_type,
+            double_precision=transformer.config.double_precision_rope,
+        )
+        mx.eval(precomputed_video_rope, precomputed_audio_rope)
+    else:
+        mx.eval(precomputed_video_rope)
+
     if compile_step and enable_audio:
         def step_fn(
             latents_in: mx.array,
@@ -426,6 +608,7 @@ def denoise_distilled(
                 context=text_embeddings,
                 context_mask=None,
                 enabled=True,
+                positional_embeddings=precomputed_video_rope,
             )
 
             ab, ac, at, af = audio_latents_in.shape
@@ -439,6 +622,7 @@ def denoise_distilled(
                 context=audio_embeddings,
                 context_mask=None,
                 enabled=True,
+                positional_embeddings=precomputed_audio_rope,
             )
 
             velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
@@ -452,17 +636,25 @@ def denoise_distilled(
             if state is not None:
                 denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
 
-            latents_f32 = latents_in.astype(mx.float32)
-            denoised_f32 = denoised.astype(mx.float32)
-            sigma_next_f32 = sigma_next_in.astype(mx.float32)
-            sigma_f32 = sigma_in.astype(mx.float32)
-            latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+            if fp32_euler:
+                latents_f32 = latents_in.astype(mx.float32)
+                denoised_f32 = denoised.astype(mx.float32)
+                sigma_next_f32 = sigma_next_in.astype(mx.float32)
+                sigma_f32 = sigma_in.astype(mx.float32)
+                latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+            else:
+                latents_out = (denoised + sigma_next_in * (latents_in - denoised) / sigma_in).astype(dtype)
 
-            audio_latents_f32 = audio_latents_in.astype(mx.float32)
-            audio_denoised_f32 = audio_denoised.astype(mx.float32)
-            audio_latents_out = (
-                audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32
-            ).astype(dtype)
+            if fp32_euler:
+                audio_latents_f32 = audio_latents_in.astype(mx.float32)
+                audio_denoised_f32 = audio_denoised.astype(mx.float32)
+                audio_latents_out = (
+                    audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32
+                ).astype(dtype)
+            else:
+                audio_latents_out = (
+                    audio_denoised + sigma_next_in * (audio_latents_in - audio_denoised) / sigma_in
+                ).astype(dtype)
 
             return latents_out, audio_latents_out
 
@@ -485,6 +677,7 @@ def denoise_distilled(
                 context=text_embeddings,
                 context_mask=None,
                 enabled=True,
+                positional_embeddings=precomputed_video_rope,
             )
 
             velocity, _ = transformer(video=video_modality, audio=None)
@@ -494,11 +687,14 @@ def denoise_distilled(
             if state is not None:
                 denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
 
-            latents_f32 = latents_in.astype(mx.float32)
-            denoised_f32 = denoised.astype(mx.float32)
-            sigma_next_f32 = sigma_next_in.astype(mx.float32)
-            sigma_f32 = sigma_in.astype(mx.float32)
-            latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+            if fp32_euler:
+                latents_f32 = latents_in.astype(mx.float32)
+                denoised_f32 = denoised.astype(mx.float32)
+                sigma_next_f32 = sigma_next_in.astype(mx.float32)
+                sigma_f32 = sigma_in.astype(mx.float32)
+                latents_out = (denoised_f32 + sigma_next_f32 * (latents_f32 - denoised_f32) / sigma_f32).astype(dtype)
+            else:
+                latents_out = (denoised + sigma_next_in * (latents_in - denoised) / sigma_in).astype(dtype)
             return latents_out
 
         step_fn = mx.compile(step_fn, shapeless=compile_shapeless)
@@ -538,6 +734,7 @@ def denoise_distilled(
                     context=text_embeddings,
                     context_mask=None,
                     enabled=True,
+                    positional_embeddings=precomputed_video_rope,
                 )
 
                 audio_modality = None
@@ -552,6 +749,7 @@ def denoise_distilled(
                         context=audio_embeddings,
                         context_mask=None,
                         enabled=True,
+                        positional_embeddings=precomputed_audio_rope,
                     )
 
                 velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
@@ -597,6 +795,145 @@ def denoise_distilled(
     if enable_audio:
         _debug_stats("audio_latents_after_denoise_distilled", audio_latents)
     return latents, audio_latents if enable_audio else None
+
+
+# =============================================================================
+# Audio-only Denoising (no CFG, fixed sigmas)
+# =============================================================================
+
+def denoise_audio_only(
+    audio_latents: mx.array,
+    audio_positions: mx.array,
+    audio_embeddings: mx.array,
+    transformer: LTXModel,
+    sigmas: list[float],
+    verbose: bool = True,
+    eval_interval: int = 1,
+    compile_step: bool = False,
+    compile_shapeless: bool = False,
+    fp32_euler: bool = True,
+) -> mx.array:
+    """Run a distilled-style denoising loop for AudioOnly transformers.
+
+    This is used for "separate" audio generation (generate video first, then audio
+    with an AudioOnly model). We intentionally do not use CFG here; for the current
+    audio branch, CFG can collapse to near-silence.
+    """
+    from mlx_video.models.ltx.rope import precompute_freqs_cis
+
+    dtype = audio_latents.dtype
+    num_steps = len(sigmas) - 1
+    sigmas_mx = mx.array(sigmas, dtype=dtype)
+
+    ab, ac, at, af = audio_latents.shape
+    audio_timesteps_mask = mx.ones((ab, at), dtype=dtype)
+
+    precomputed_audio_rope = precompute_freqs_cis(
+        audio_positions,
+        dim=transformer.audio_inner_dim,
+        theta=transformer.positional_embedding_theta,
+        max_pos=transformer.audio_positional_embedding_max_pos,
+        use_middle_indices_grid=transformer.use_middle_indices_grid,
+        num_attention_heads=transformer.audio_num_attention_heads,
+        rope_type=transformer.rope_type,
+        double_precision=transformer.config.double_precision_rope,
+    )
+    mx.eval(precomputed_audio_rope)
+
+    step_fn = None
+    if compile_step:
+        def _step_fn(
+            audio_latents_in: mx.array,
+            sigma_in: mx.array,
+            sigma_next_in: mx.array,
+        ) -> mx.array:
+            ab, ac, at, af = audio_latents_in.shape
+            audio_flat = mx.transpose(audio_latents_in, (0, 2, 1, 3))
+            audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
+
+            audio_modality = Modality(
+                latent=audio_flat,
+                timesteps=sigma_in * audio_timesteps_mask,
+                positions=audio_positions,
+                context=audio_embeddings,
+                context_mask=None,
+                enabled=True,
+                positional_embeddings=precomputed_audio_rope,
+            )
+
+            _, audio_velocity = transformer(video=None, audio=audio_modality)
+            audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
+            audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
+            audio_denoised = to_denoised(audio_latents_in, audio_velocity, sigma_in)
+
+            if fp32_euler:
+                audio_latents_f32 = audio_latents_in.astype(mx.float32)
+                audio_denoised_f32 = audio_denoised.astype(mx.float32)
+                sigma_next_f32 = sigma_next_in.astype(mx.float32)
+                sigma_f32 = sigma_in.astype(mx.float32)
+                audio_latents_out = (
+                    audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32
+                ).astype(dtype)
+            else:
+                audio_latents_out = (
+                    audio_denoised + sigma_next_in * (audio_latents_in - audio_denoised) / sigma_in
+                ).astype(dtype)
+            return audio_latents_out
+
+        step_fn = mx.compile(_step_fn, shapeless=compile_shapeless)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        disable=not verbose,
+    ) as progress:
+        task = progress.add_task("[cyan]Denoising audio[/]", total=num_steps)
+
+        for i in range(num_steps):
+            sigma_mx = sigmas_mx[i]
+            sigma_next_mx = sigmas_mx[i + 1]
+
+            if step_fn is not None:
+                audio_latents = step_fn(audio_latents, sigma_mx, sigma_next_mx)
+            else:
+                audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))
+                audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
+
+                audio_modality = Modality(
+                    latent=audio_flat,
+                    timesteps=sigma_mx * audio_timesteps_mask,
+                    positions=audio_positions,
+                    context=audio_embeddings,
+                    context_mask=None,
+                    enabled=True,
+                    positional_embeddings=precomputed_audio_rope,
+                )
+
+                _, audio_velocity = transformer(video=None, audio=audio_modality)
+                audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
+                audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))
+                audio_denoised = to_denoised(audio_latents, audio_velocity, sigma_mx)
+
+                # Euler step (float32 for precision)
+                if sigmas[i + 1] > 0:
+                    sigma_next_f32 = mx.array(sigmas[i + 1], dtype=mx.float32)
+                    sigma_f32 = mx.array(sigmas[i], dtype=mx.float32)
+                    audio_latents_f32 = audio_latents.astype(mx.float32)
+                    audio_denoised_f32 = audio_denoised.astype(mx.float32)
+                    audio_latents = (audio_denoised_f32 + sigma_next_f32 * (audio_latents_f32 - audio_denoised_f32) / sigma_f32).astype(dtype)
+                else:
+                    audio_latents = audio_denoised
+
+            if (i + 1) % eval_interval == 0 or i == num_steps - 1:
+                mx.eval(audio_latents)
+            progress.advance(task)
+
+    _debug_stats("audio_latents_after_denoise_audio_only", audio_latents)
+    return audio_latents
 
 
 # =============================================================================
@@ -1310,6 +1647,87 @@ def _write_video_cv2(video_np: np.ndarray, path: Path, fps: float, console: Opti
     raise RuntimeError(f"Could not open video writer for {path}")
 
 
+def _write_video_ffmpeg(
+    video_np: np.ndarray,
+    path: Path,
+    fps: float,
+    console: Optional[Console] = None,
+    codec: str = "libx264",
+    preset: str = "veryfast",
+    crf: int = 18,
+) -> None:
+    """Write a uint8 RGB video to disk via ffmpeg (raw RGB24 pipe).
+
+    This can be significantly faster than OpenCV encoding and often yields better
+    quality/bitrate control. Falls back to callers when ffmpeg isn't available.
+    """
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise FileNotFoundError("ffmpeg not found")
+
+    h, w = video_np.shape[1], video_np.shape[2]
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{w}x{h}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        codec,
+        "-preset",
+        preset,
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        str(path),
+    ]
+
+    try:
+        # Use DEVNULL for stdout to avoid deadlocks on long runs; stderr is enough for diagnostics.
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        assert proc.stdin is not None
+        # Avoid materializing a giant bytes object; stream frame bytes.
+        for frame in video_np:
+            proc.stdin.write(frame.tobytes(order="C"))
+        proc.stdin.close()
+        # Do not call communicate() after closing stdin; it may attempt to flush a closed file.
+        proc.wait()
+        stderr = b""
+        if proc.stderr is not None:
+            stderr = proc.stderr.read()
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.decode(errors="ignore"))
+    except Exception as exc:
+        if console:
+            console.print(f"[yellow]⚠️  ffmpeg encode failed; falling back. ({exc})[/]")
+        raise
+
+
+def _write_video(
+    video_np: np.ndarray,
+    path: Path,
+    fps: float,
+    console: Optional[Console] = None,
+    encoder: str = "cv2",
+) -> None:
+    """Write video using the selected encoder ("cv2" or "ffmpeg")."""
+    if encoder == "ffmpeg":
+        _write_video_ffmpeg(video_np, path, fps, console=console)
+        return
+    _write_video_cv2(video_np, path, fps, console=console)
+
+
 def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RATE):
     """Save audio to WAV file."""
     import wave
@@ -1337,9 +1755,16 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-i", str(audio_path),
+        # Explicit mapping avoids ffmpeg picking the wrong streams when inputs
+        # contain unexpected metadata/streams.
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "aac",
-        "-shortest",
+        # Do NOT use -shortest here. Audio generation may be slightly shorter
+        # than the video duration due to hop-size rounding, and -shortest will
+        # truncate the video (dropping last frames).
+        "-movflags", "+faststart",
         str(output_path)
     ]
 
@@ -1373,7 +1798,10 @@ def generate_video(
     fps: float = 24.0,
     output_path: str = "output.mp4",
     save_frames: bool = False,
+    video_encoder: str = "cv2",
     verbose: bool = True,
+    profile: bool = False,
+    profile_json_path: Optional[str] = None,
     enhance_prompt: bool = False,
     enhance_prompt_model: Optional[str] = None,
     max_tokens: int = 512,
@@ -1388,6 +1816,9 @@ def generate_video(
     tiling: str = "auto",
     stream: bool = False,
     audio: bool = False,
+    audio_mode: str = "auto",
+    audio_model_repo: Optional[str] = None,
+    audio_steps: int = 8,
     output_audio_path: Optional[str] = None,
     mem_log: bool = False,
     clear_cache: bool = False,
@@ -1397,6 +1828,7 @@ def generate_video(
     compile_step: bool = False,
     compile_shapeless: bool = False,
     cfg_batch: bool = False,
+    fp32_euler: bool = True,
     metal_capture: bool = False,
     metal_capture_path: Optional[str] = None,
     metal_capture_phase: str = "denoise",
@@ -1406,6 +1838,7 @@ def generate_video(
     stage2_dev: bool = False,
     stage1_steps: int = 8,
     stage2_steps: int = 3,
+    sigma_subsample: str = "farthest",
     auto_output_name: bool = False,
     output_name_model: Optional[str] = None,
 ):
@@ -1430,7 +1863,10 @@ def generate_video(
         fps: Frames per second for output video
         output_path: Path to save the output video
         save_frames: Whether to save individual frames as images
+        video_encoder: Video encoder to use for MP4 writing ("cv2" or "ffmpeg")
         verbose: Whether to print progress
+        profile: Print a phase timing breakdown at the end (for benchmarking)
+        profile_json_path: Optional path to write phase timings as JSON ("auto" writes next to output)
         enhance_prompt: Whether to enhance prompt using Gemma
         enhance_prompt_model: Optional model repo for prompt enhancement
         max_tokens: Max tokens for prompt enhancement
@@ -1445,6 +1881,12 @@ def generate_video(
         tiling: Tiling mode for VAE decoding
         stream: Stream frames to output as they're decoded
         audio: Enable synchronized audio generation
+        audio_mode: Audio generation strategy when --audio is enabled:
+            - auto: use "separate" for distilled pipelines (better audio), "joint" for dev
+            - joint: generate audio latents together with video (AudioVideo model)
+            - separate: generate video first (VideoOnly), then audio with an AudioOnly model
+        audio_model_repo: Optional model repo/directory for separate audio transformer weights.
+        audio_steps: Number of denoising steps for separate audio generation (default 8).
         output_audio_path: Path to save audio file
         mem_log: Log active/cache/peak memory at key stages
         clear_cache: Clear MLX cache after generation
@@ -1454,6 +1896,7 @@ def generate_video(
         compile_step: Compile denoise step for repeated execution
         compile_shapeless: Allow recompilation for varying shapes (slower, more flexible)
         cfg_batch: If True, batch CFG pos/neg into one forward (more memory)
+        fp32_euler: If True, compute Euler updates in float32 for numerical stability (slower)
         metal_capture: Enable Metal GPU capture (requires MTL_CAPTURE_ENABLED=1)
         metal_capture_path: Path for the .gputrace output (must not exist)
         metal_capture_phase: "denoise", "decode", or "all"
@@ -1463,10 +1906,15 @@ def generate_video(
         stage2_dev: If True, use the dev CFG denoiser for stage-2 refinement (distilled pipelines only)
         stage1_steps: Number of denoising steps in stage 1 (distilled pipelines only; default 8)
         stage2_steps: Number of refinement steps in stage 2 (distilled pipelines only; default 3)
+        sigma_subsample: Subsampling method for fixed sigma schedules when reducing steps ("uniform" or "farthest")
         auto_output_name: If True, auto-generate output filename from prompt
         output_name_model: Optional model repo for filename generation
     """
     start_time = time.time()
+    phase_timer = _PhaseTimer(profile)
+    if video_encoder not in ("cv2", "ffmpeg"):
+        console.print(f"[yellow]⚠️  Unknown video encoder '{video_encoder}', using cv2[/]")
+        video_encoder = "cv2"
     capture_path = None
     capture_phase = metal_capture_phase
     capture_started = False
@@ -1564,7 +2012,25 @@ def generate_video(
 
     is_i2v = len(images_list) > 0
     mode_str = "I2V" if is_i2v else "T2V"
+    if sigma_subsample not in ("uniform", "farthest"):
+        raise ValueError("--sigma-subsample must be 'uniform' or 'farthest'.")
+
+    audio_mode = (audio_mode or "auto").lower()
+    if audio_mode not in ("auto", "joint", "separate"):
+        raise ValueError("--audio-mode must be one of: auto, joint, separate")
+
+    audio_mode_effective = "off"
+    joint_audio = False
+    separate_audio = False
     if audio:
+        if audio_mode == "auto":
+            # Distilled audio latents are often tonal; separate audio uses a dev
+            # AudioOnly transformer and tends to be less "zoom"-like.
+            audio_mode_effective = "separate" if pipeline != PipelineType.DEV else "joint"
+        else:
+            audio_mode_effective = audio_mode
+        joint_audio = audio_mode_effective == "joint"
+        separate_audio = audio_mode_effective == "separate"
         mode_str += "+Audio"
 
     if pipeline == PipelineType.DEV:
@@ -1581,6 +2047,8 @@ def generate_video(
 
     if is_dev_pipeline:
         console.print(f"[dim]Steps: {num_inference_steps}, CFG: {cfg_scale}[/]")
+    if audio:
+        console.print(f"[dim]Audio mode: {audio_mode_effective}[/]")
 
     if is_i2v:
         for img_path, frame_idx, strength in images_list:
@@ -1779,18 +2247,20 @@ def generate_video(
     enhanced_with_alt = False
 
     # Load text encoder for embeddings
-    with console.status("[blue]📝 Loading text encoder...[/]", spinner="dots"):
-        from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
-        text_encoder = LTX2TextEncoder()
-        text_encoder.load(model_path=model_path, text_encoder_path=text_encoder_path)
-        mx.eval(text_encoder.parameters())
-    console.print("[green]✓[/] Text encoder loaded")
+    with phase_timer.phase("text_encoder_load"):
+        with console.status("[blue]📝 Loading text encoder...[/]", spinner="dots"):
+            from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
+            text_encoder = LTX2TextEncoder()
+            text_encoder.load(model_path=model_path, text_encoder_path=text_encoder_path)
+            mx.eval(text_encoder.parameters())
+        console.print("[green]✓[/] Text encoder loaded")
 
     # Optionally enhance the prompt (default path, if not already enhanced)
     if enhance_prompt and not enhanced_with_alt:
-        console.print("[bold magenta]✨ Enhancing prompt[/]")
-        prompt = text_encoder.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
-        console.print(f"[dim]Enhanced prompt:[/]\n{prompt}")
+        with phase_timer.phase("prompt_enhance"):
+            console.print("[bold magenta]✨ Enhancing prompt[/]")
+            prompt = text_encoder.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
+            console.print(f"[dim]Enhanced prompt:[/]\n{prompt}")
 
     # Some distilled workflows (e.g. dev refinement in stage-2) need dev-style
     # pos/neg embeddings even when the stage-1 pipeline is distilled.
@@ -1803,53 +2273,59 @@ def generate_video(
     text_embeddings = None
     audio_embeddings = None
 
-    if need_dev_embeddings:
-        # Dev-style: positive + negative embeddings for CFG (used by dev pipeline,
-        # and optionally by distilled stage-2 dev refinement).
-        if audio:
-            video_embeddings_pos, audio_embeddings_pos = text_encoder(prompt, return_audio_embeddings=True)
-            video_embeddings_neg, audio_embeddings_neg = text_encoder(negative_prompt, return_audio_embeddings=True)
-            model_dtype = video_embeddings_pos.dtype
-            mx.eval(video_embeddings_pos, video_embeddings_neg, audio_embeddings_pos, audio_embeddings_neg)
-            _debug_stats("video_embeddings_pos", video_embeddings_pos)
-            _debug_stats("video_embeddings_neg", video_embeddings_neg)
-            _debug_stats("audio_embeddings_pos", audio_embeddings_pos)
-            _debug_stats("audio_embeddings_neg", audio_embeddings_neg)
-        else:
-            video_embeddings_pos, _ = text_encoder(prompt, return_audio_embeddings=False)
-            video_embeddings_neg, _ = text_encoder(negative_prompt, return_audio_embeddings=False)
-            model_dtype = video_embeddings_pos.dtype
-            mx.eval(video_embeddings_pos, video_embeddings_neg)
-            _debug_stats("video_embeddings_pos", video_embeddings_pos)
-            _debug_stats("video_embeddings_neg", video_embeddings_neg)
+    with phase_timer.phase("prompt_encode"):
+        if need_dev_embeddings:
+            # Dev-style: positive + negative embeddings for CFG (used by dev pipeline,
+            # and optionally by distilled stage-2 dev refinement).
+            if audio:
+                video_embeddings_pos, audio_embeddings_pos = text_encoder(prompt, return_audio_embeddings=True)
+                video_embeddings_neg, audio_embeddings_neg = text_encoder(negative_prompt, return_audio_embeddings=True)
+                model_dtype = video_embeddings_pos.dtype
+                mx.eval(video_embeddings_pos, video_embeddings_neg, audio_embeddings_pos, audio_embeddings_neg)
+                _debug_stats("video_embeddings_pos", video_embeddings_pos)
+                _debug_stats("video_embeddings_neg", video_embeddings_neg)
+                _debug_stats("audio_embeddings_pos", audio_embeddings_pos)
+                _debug_stats("audio_embeddings_neg", audio_embeddings_neg)
+            else:
+                video_embeddings_pos, _ = text_encoder(prompt, return_audio_embeddings=False)
+                video_embeddings_neg, _ = text_encoder(negative_prompt, return_audio_embeddings=False)
+                model_dtype = video_embeddings_pos.dtype
+                mx.eval(video_embeddings_pos, video_embeddings_neg)
+                _debug_stats("video_embeddings_pos", video_embeddings_pos)
+                _debug_stats("video_embeddings_neg", video_embeddings_neg)
 
-        # For distilled stage-1/stage-2 (non-dev pipelines), reuse the positive
-        # embedding as the single conditioning embedding.
-        if not is_dev_pipeline:
-            text_embeddings = video_embeddings_pos
-            audio_embeddings = audio_embeddings_pos
-    else:
-        # Distilled pipeline - single embedding
-        if audio:
-            text_embeddings, audio_embeddings = text_encoder(prompt, return_audio_embeddings=True)
-            mx.eval(text_embeddings, audio_embeddings)
-            _debug_stats("text_embeddings", text_embeddings)
-            _debug_stats("audio_embeddings", audio_embeddings)
+            # For distilled stage-1/stage-2 (non-dev pipelines), reuse the positive
+            # embedding as the single conditioning embedding.
+            if not is_dev_pipeline:
+                text_embeddings = video_embeddings_pos
+                audio_embeddings = audio_embeddings_pos
         else:
-            text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
-            audio_embeddings = None
-            mx.eval(text_embeddings)
-            _debug_stats("text_embeddings", text_embeddings)
-        model_dtype = text_embeddings.dtype
+            # Distilled pipeline - single embedding
+            if audio:
+                text_embeddings, audio_embeddings = text_encoder(prompt, return_audio_embeddings=True)
+                mx.eval(text_embeddings, audio_embeddings)
+                _debug_stats("text_embeddings", text_embeddings)
+                _debug_stats("audio_embeddings", audio_embeddings)
+            else:
+                text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
+                audio_embeddings = None
+                mx.eval(text_embeddings)
+                _debug_stats("text_embeddings", text_embeddings)
+            model_dtype = text_embeddings.dtype
 
     del text_encoder
     mx.clear_cache()
     _log_memory("text encoder freed", mem_log)
 
     # Load transformer (stage-1)
-    transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
+    transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer"
+    if joint_audio:
+        transformer_desc += " (A/V mode)"
+    elif audio and separate_audio:
+        transformer_desc += " (video-only; audio separate)"
+    transformer_desc += "..."
 
-    model_type = LTXModelType.AudioVideo if audio else LTXModelType.VideoOnly
+    model_type = LTXModelType.AudioVideo if joint_audio else LTXModelType.VideoOnly
     config_kwargs = dict(
         model_type=model_type,
         num_attention_heads=32,
@@ -1866,7 +2342,7 @@ def generate_video(
         use_middle_indices_grid=True,
         timestep_scale_multiplier=1000,
     )
-    if audio:
+    if joint_audio:
         config_kwargs.update(
             audio_num_attention_heads=32,
             audio_attention_head_dim=64,
@@ -2010,10 +2486,11 @@ def generate_video(
             )
         return transformer_local
 
-    with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
-        transformer = _load_transformer_with_loras(loras)
+    with phase_timer.phase("stage1_transformer_load"):
+        with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
+            transformer = _load_transformer_with_loras(loras)
 
-    console.print("[green]✓[/] Transformer loaded")
+        console.print("[green]✓[/] Transformer loaded")
     _log_memory("transformer loaded", mem_log)
 
     # ==========================================================================
@@ -2035,54 +2512,55 @@ def generate_video(
         stage1_video_conditionings = []
 
         if is_i2v or video_conditionings:
-            with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
-                vae_encoder = load_vae_encoder(
-                    str(weight_file_path),
-                    weights_override=_unified_subset("vae_encoder."),
-                )
-                mx.eval(vae_encoder.parameters())
-
-                for img_path, frame_idx, strength in images_list:
-                    input_image = load_image(img_path, height=height // 2, width=width // 2, dtype=model_dtype)
-                    stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2, dtype=model_dtype)
-                    stage1_latent = vae_encoder(stage1_image_tensor)
-                    mx.eval(stage1_latent)
-
-                    input_image = load_image(img_path, height=height, width=width, dtype=model_dtype)
-                    stage2_image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
-                    stage2_latent = vae_encoder(stage2_image_tensor)
-                    mx.eval(stage2_latent)
-                    resolved_idx = _resolve_frame_idx(frame_idx)
-
-                    if conditioning_mode == "guide":
-                        stage1_conditionings.append(
-                            VideoConditionByKeyframeIndex(keyframes=stage1_latent, frame_idx=resolved_idx, strength=strength)
-                        )
-                        stage2_conditionings.append(
-                            VideoConditionByKeyframeIndex(keyframes=stage2_latent, frame_idx=resolved_idx, strength=strength)
-                        )
-                    else:
-                        stage1_conditionings.append(
-                            VideoConditionByLatentIndex(latent=stage1_latent, frame_idx=resolved_idx, strength=strength)
-                        )
-                        stage2_conditionings.append(
-                            VideoConditionByLatentIndex(latent=stage2_latent, frame_idx=resolved_idx, strength=strength)
-                        )
-
-                # Video conditioning (IC-LoRA)
-                for vid_path, frame_idx, strength in video_conditionings:
-                    frames = load_video(vid_path, height=height // 2, width=width // 2, frame_cap=num_frames, dtype=model_dtype)
-                    video_tensor = prepare_video_for_encoding(frames, height // 2, width // 2, dtype=model_dtype)
-                    video_latent = vae_encoder(video_tensor)
-                    mx.eval(video_latent)
-                    resolved_idx = _resolve_frame_idx(frame_idx)
-                    stage1_video_conditionings.append(
-                        VideoConditionByKeyframeIndex(keyframes=video_latent, frame_idx=resolved_idx, strength=strength)
+            with phase_timer.phase("cond_encode"):
+                with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
+                    vae_encoder = load_vae_encoder(
+                        str(weight_file_path),
+                        weights_override=_unified_subset("vae_encoder."),
                     )
+                    mx.eval(vae_encoder.parameters())
 
-                del vae_encoder
-                mx.clear_cache()
-            console.print("[green]✓[/] VAE encoder loaded and image encoded")
+                    for img_path, frame_idx, strength in images_list:
+                        input_image = load_image(img_path, height=height // 2, width=width // 2, dtype=model_dtype)
+                        stage1_image_tensor = prepare_image_for_encoding(input_image, height // 2, width // 2, dtype=model_dtype)
+                        stage1_latent = vae_encoder(stage1_image_tensor)
+                        mx.eval(stage1_latent)
+
+                        input_image = load_image(img_path, height=height, width=width, dtype=model_dtype)
+                        stage2_image_tensor = prepare_image_for_encoding(input_image, height, width, dtype=model_dtype)
+                        stage2_latent = vae_encoder(stage2_image_tensor)
+                        mx.eval(stage2_latent)
+                        resolved_idx = _resolve_frame_idx(frame_idx)
+
+                        if conditioning_mode == "guide":
+                            stage1_conditionings.append(
+                                VideoConditionByKeyframeIndex(keyframes=stage1_latent, frame_idx=resolved_idx, strength=strength)
+                            )
+                            stage2_conditionings.append(
+                                VideoConditionByKeyframeIndex(keyframes=stage2_latent, frame_idx=resolved_idx, strength=strength)
+                            )
+                        else:
+                            stage1_conditionings.append(
+                                VideoConditionByLatentIndex(latent=stage1_latent, frame_idx=resolved_idx, strength=strength)
+                            )
+                            stage2_conditionings.append(
+                                VideoConditionByLatentIndex(latent=stage2_latent, frame_idx=resolved_idx, strength=strength)
+                            )
+
+                    # Video conditioning (IC-LoRA)
+                    for vid_path, frame_idx, strength in video_conditionings:
+                        frames = load_video(vid_path, height=height // 2, width=width // 2, frame_cap=num_frames, dtype=model_dtype)
+                        video_tensor = prepare_video_for_encoding(frames, height // 2, width // 2, dtype=model_dtype)
+                        video_latent = vae_encoder(video_tensor)
+                        mx.eval(video_latent)
+                        resolved_idx = _resolve_frame_idx(frame_idx)
+                        stage1_video_conditionings.append(
+                            VideoConditionByKeyframeIndex(keyframes=video_latent, frame_idx=resolved_idx, strength=strength)
+                        )
+
+                    del vae_encoder
+                    mx.clear_cache()
+                console.print("[green]✓[/] VAE encoder loaded and image encoded")
             if verbose:
                 if stage1_conditionings:
                     console.print(f"[dim]Stage1 image conditionings: {len(stage1_conditionings)}[/]")
@@ -2096,12 +2574,7 @@ def generate_video(
                         console.print(f"[dim]  - {idx}: shape={shape}, frame={cond.frame_idx}, strength={cond.strength}[/]")
 
         # Stage 1
-        stage1_sigmas_list = STAGE_1_SIGMAS
-        if stage1_steps != (len(STAGE_1_SIGMAS) - 1):
-            idxs = [round(i * (len(STAGE_1_SIGMAS) - 1) / stage1_steps) for i in range(stage1_steps + 1)]
-            if sorted(set(idxs)) != idxs:
-                raise ValueError("Invalid stage1 sigma subsample (duplicate indices).")
-            stage1_sigmas_list = [STAGE_1_SIGMAS[i] for i in idxs]
+        stage1_sigmas_list = _subsample_sigmas(STAGE_1_SIGMAS, stage1_steps, sigma_subsample)
 
         console.print(f"\n[bold yellow]⚡ Stage 1:[/] Generating at {width//2}x{height//2} ({stage1_steps} steps)")
         mx.random.seed(seed)
@@ -2111,7 +2584,7 @@ def generate_video(
 
         audio_positions = None
         audio_latents = None
-        if audio:
+        if joint_audio:
             audio_positions = create_audio_position_grid(1, audio_frames)
             audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)).astype(model_dtype)
             mx.eval(audio_positions, audio_latents)
@@ -2144,41 +2617,40 @@ def generate_video(
         if audio_latents is not None:
             _debug_stats("audio_latents_stage1_initial", audio_latents)
 
-        latents, audio_latents = denoise_distilled(
-            latents, positions, text_embeddings, transformer, stage1_sigmas_list,
-            verbose=verbose, state=state1,
-            audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
-            eval_interval=eval_interval,
-            compile_step=compile_step,
-            compile_shapeless=compile_shapeless,
-        )
+        with phase_timer.phase("stage1_denoise"):
+            latents, audio_latents = denoise_distilled(
+                latents, positions, text_embeddings, transformer, stage1_sigmas_list,
+                verbose=verbose, state=state1,
+                audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
+                eval_interval=eval_interval,
+                compile_step=compile_step,
+                compile_shapeless=compile_shapeless,
+                fp32_euler=fp32_euler,
+            )
         _log_memory("stage1 complete", mem_log)
 
         # Upsample latents
-        with console.status("[magenta]🔍 Upsampling latents 2x...[/]", spinner="dots"):
-            upsampler = load_upsampler(str(model_path / 'ltx-2-spatial-upscaler-x2-1.0.safetensors'))
-            mx.eval(upsampler.parameters())
+        with phase_timer.phase("upsample"):
+            with console.status("[magenta]🔍 Upsampling latents 2x...[/]", spinner="dots"):
+                upsampler = load_upsampler(str(model_path / 'ltx-2-spatial-upscaler-x2-1.0.safetensors'))
+                mx.eval(upsampler.parameters())
 
-            vae_decoder = load_vae_decoder(
-                str(_resolve_vae_source()),
-                timestep_conditioning=None,
-                weights_override=_unified_subset("vae_decoder."),
-            )
+                vae_decoder = load_vae_decoder(
+                    str(_resolve_vae_source()),
+                    timestep_conditioning=None,
+                    weights_override=_unified_subset("vae_decoder."),
+                )
 
-            latents = upsample_latents(latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
-            mx.eval(latents)
-            _debug_stats("latents_after_upsample", latents)
+                latents = upsample_latents(latents, upsampler, vae_decoder.latents_mean, vae_decoder.latents_std)
+                mx.eval(latents)
+                _debug_stats("latents_after_upsample", latents)
 
-            del upsampler
-            mx.clear_cache()
-        console.print("[green]✓[/] Latents upsampled")
+                del upsampler
+                mx.clear_cache()
+            console.print("[green]✓[/] Latents upsampled")
 
         # Stage 2
-        stage2_sigmas_list = {
-            1: [STAGE_2_SIGMAS[0], STAGE_2_SIGMAS[-1]],
-            2: [STAGE_2_SIGMAS[0], STAGE_2_SIGMAS[2], STAGE_2_SIGMAS[-1]],
-            3: STAGE_2_SIGMAS,
-        }[stage2_steps]
+        stage2_sigmas_list = _subsample_refinement_sigmas(STAGE_2_SIGMAS, stage2_steps, sigma_subsample)
         console.print(f"\n[bold yellow]⚡ Stage 2:[/] Refining at {width}x{height} ({stage2_steps} steps)")
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
@@ -2198,34 +2670,35 @@ def generate_video(
                 )
 
         if stage2_model_repo or use_stage2_dev or distilled_loras:
-            del transformer
-            mx.clear_cache()
-            _log_memory("before stage2 transformer load", mem_log)
+            with phase_timer.phase("stage2_transformer_load"):
+                del transformer
+                mx.clear_cache()
+                _log_memory("before stage2 transformer load", mem_log)
 
-            if distilled_loras:
-                with console.status("[blue]🤖 Loading stage-2 transformer (distilled LoRA)...[/]", spinner="dots"):
-                    transformer = _load_transformer_with_loras(distilled_loras)
-                console.print("[green]✓[/] Stage-2 transformer loaded")
-            else:
-                stage2_path = model_path if stage2_model_repo is None else get_model_path(stage2_model_repo)
-                stage2_is_dev = bool(use_stage2_dev)
-                stage2_kind = "dev" if stage2_is_dev else "distilled"
-                stage2_mlx_weight = stage2_path / f"ltx-2-19b-{stage2_kind}-mlx.safetensors"
-                stage2_weight = stage2_path / f"ltx-2-19b-{stage2_kind}.safetensors"
-                stage2_weights_path = stage2_mlx_weight if stage2_mlx_weight.exists() else stage2_weight
-                if not stage2_weights_path.exists():
-                    raise FileNotFoundError(
-                        f"Stage-2 weights not found at {stage2_weights_path}. "
-                        "Ensure the stage-2 model repo contains LTX-2 weights."
-                    )
-                stage2_desc = f"{stage2_kind} transformer" + (f" from {stage2_path}" if stage2_model_repo else "")
-                with console.status(f"[blue]🤖 Loading stage-2 {stage2_desc}...[/]", spinner="dots"):
-                    transformer = LTXModel.from_pretrained(
-                        model_path=stage2_weights_path,
-                        config=config,
-                        strict=False,
-                    )
-                console.print("[green]✓[/] Stage-2 transformer loaded")
+                if distilled_loras:
+                    with console.status("[blue]🤖 Loading stage-2 transformer (distilled LoRA)...[/]", spinner="dots"):
+                        transformer = _load_transformer_with_loras(distilled_loras)
+                    console.print("[green]✓[/] Stage-2 transformer loaded")
+                else:
+                    stage2_path = model_path if stage2_model_repo is None else get_model_path(stage2_model_repo)
+                    stage2_is_dev = bool(use_stage2_dev)
+                    stage2_kind = "dev" if stage2_is_dev else "distilled"
+                    stage2_mlx_weight = stage2_path / f"ltx-2-19b-{stage2_kind}-mlx.safetensors"
+                    stage2_weight = stage2_path / f"ltx-2-19b-{stage2_kind}.safetensors"
+                    stage2_weights_path = stage2_mlx_weight if stage2_mlx_weight.exists() else stage2_weight
+                    if not stage2_weights_path.exists():
+                        raise FileNotFoundError(
+                            f"Stage-2 weights not found at {stage2_weights_path}. "
+                            "Ensure the stage-2 model repo contains LTX-2 weights."
+                        )
+                    stage2_desc = f"{stage2_kind} transformer" + (f" from {stage2_path}" if stage2_model_repo else "")
+                    with console.status(f"[blue]🤖 Loading stage-2 {stage2_desc}...[/]", spinner="dots"):
+                        transformer = LTXModel.from_pretrained(
+                            model_path=stage2_weights_path,
+                            config=config,
+                            strict=False,
+                        )
+                    console.print("[green]✓[/] Stage-2 transformer loaded")
 
         state2 = None
         if stage2_conditionings and verbose:
@@ -2253,7 +2726,7 @@ def generate_video(
             latents = state2.latent
             mx.eval(latents)
 
-            if audio and audio_latents is not None:
+            if joint_audio and audio_latents is not None:
                 audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
                 one_minus_scale = mx.array(1.0, dtype=model_dtype) - noise_scale
                 audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
@@ -2265,7 +2738,7 @@ def generate_video(
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
 
-            if audio and audio_latents is not None:
+            if joint_audio and audio_latents is not None:
                 audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
                 audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
                 mx.eval(audio_latents)
@@ -2273,42 +2746,44 @@ def generate_video(
         if audio_latents is not None:
             _debug_stats("audio_latents_stage2_initial", audio_latents)
 
-        if use_stage2_dev:
-            # Use dev denoiser (CFG) for stage-2 refinement while keeping the
-            # distilled two-stage structure for speed. We keep the distilled stage-2
-            # sigma schedule and just swap the denoiser to CFG.
-            sigmas_stage2 = mx.array(stage2_sigmas_list, dtype=model_dtype)
-            mx.eval(sigmas_stage2)
-            if audio:
-                latents, audio_latents = denoise_dev_av(
-                    latents, audio_latents,
-                    positions, audio_positions,
-                    video_embeddings_pos, video_embeddings_neg,
-                    audio_embeddings_pos, audio_embeddings_neg,
-                    transformer, sigmas_stage2, cfg_scale=cfg_scale, verbose=verbose, video_state=state2,
-                    eval_interval=eval_interval,
-                    compile_step=compile_step,
-                    compile_shapeless=compile_shapeless,
-                    cfg_batch=cfg_batch,
-                )
+        with phase_timer.phase("stage2_denoise"):
+            if use_stage2_dev:
+                # Use dev denoiser (CFG) for stage-2 refinement while keeping the
+                # distilled two-stage structure for speed. We keep the distilled stage-2
+                # sigma schedule and just swap the denoiser to CFG.
+                sigmas_stage2 = mx.array(stage2_sigmas_list, dtype=model_dtype)
+                mx.eval(sigmas_stage2)
+                if joint_audio:
+                    latents, audio_latents = denoise_dev_av(
+                        latents, audio_latents,
+                        positions, audio_positions,
+                        video_embeddings_pos, video_embeddings_neg,
+                        audio_embeddings_pos, audio_embeddings_neg,
+                        transformer, sigmas_stage2, cfg_scale=cfg_scale, verbose=verbose, video_state=state2,
+                        eval_interval=eval_interval,
+                        compile_step=compile_step,
+                        compile_shapeless=compile_shapeless,
+                        cfg_batch=cfg_batch,
+                    )
+                else:
+                    latents = denoise_dev(
+                        latents, positions, video_embeddings_pos, video_embeddings_neg,
+                        transformer, sigmas_stage2, cfg_scale=cfg_scale, verbose=verbose, state=state2,
+                        eval_interval=eval_interval,
+                        compile_step=compile_step,
+                        compile_shapeless=compile_shapeless,
+                        cfg_batch=cfg_batch,
+                    )
             else:
-                latents = denoise_dev(
-                    latents, positions, video_embeddings_pos, video_embeddings_neg,
-                    transformer, sigmas_stage2, cfg_scale=cfg_scale, verbose=verbose, state=state2,
+                latents, audio_latents = denoise_distilled(
+                    latents, positions, text_embeddings, transformer, stage2_sigmas_list,
+                    verbose=verbose, state=state2,
+                    audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
                     eval_interval=eval_interval,
                     compile_step=compile_step,
                     compile_shapeless=compile_shapeless,
-                    cfg_batch=cfg_batch,
+                    fp32_euler=fp32_euler,
                 )
-        else:
-            latents, audio_latents = denoise_distilled(
-                latents, positions, text_embeddings, transformer, stage2_sigmas_list,
-                verbose=verbose, state=state2,
-                audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
-                eval_interval=eval_interval,
-                compile_step=compile_step,
-                compile_shapeless=compile_shapeless,
-            )
         _log_memory("stage2 complete", mem_log)
 
     else:
@@ -2363,7 +2838,7 @@ def generate_video(
 
         audio_positions = None
         audio_latents = None
-        if audio:
+        if joint_audio:
             audio_positions = create_audio_position_grid(1, audio_frames)
             audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS), dtype=model_dtype)
             mx.eval(audio_positions, audio_latents)
@@ -2404,27 +2879,28 @@ def generate_video(
                     console.print(f"[dim]Metal capture started: {capture_path}[/]")
             except Exception as exc:
                 console.print(f"[yellow]⚠️  Could not start Metal capture: {exc}[/]")
-        if audio:
-            latents, audio_latents = denoise_dev_av(
-                latents, audio_latents,
-                video_positions, audio_positions,
-                video_embeddings_pos, video_embeddings_neg,
-                audio_embeddings_pos, audio_embeddings_neg,
-                transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, video_state=video_state,
-                eval_interval=eval_interval,
-                compile_step=compile_step,
-                compile_shapeless=compile_shapeless,
-                cfg_batch=cfg_batch,
-            )
-        else:
-            latents = denoise_dev(
-                latents, video_positions, video_embeddings_pos, video_embeddings_neg,
-                transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, state=video_state,
-                eval_interval=eval_interval,
-                compile_step=compile_step,
-                compile_shapeless=compile_shapeless,
-                cfg_batch=cfg_batch,
-            )
+        with phase_timer.phase("dev_denoise"):
+            if joint_audio:
+                latents, audio_latents = denoise_dev_av(
+                    latents, audio_latents,
+                    video_positions, audio_positions,
+                    video_embeddings_pos, video_embeddings_neg,
+                    audio_embeddings_pos, audio_embeddings_neg,
+                    transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, video_state=video_state,
+                    eval_interval=eval_interval,
+                    compile_step=compile_step,
+                    compile_shapeless=compile_shapeless,
+                    cfg_batch=cfg_batch,
+                )
+            else:
+                latents = denoise_dev(
+                    latents, video_positions, video_embeddings_pos, video_embeddings_neg,
+                    transformer, sigmas, cfg_scale=cfg_scale, verbose=verbose, state=video_state,
+                    eval_interval=eval_interval,
+                    compile_step=compile_step,
+                    compile_shapeless=compile_shapeless,
+                    cfg_batch=cfg_batch,
+                )
         if capture_started and capture_phase in ("denoise", "all"):
             mx.metal.stop_capture()
             capture_started = False
@@ -2532,13 +3008,47 @@ def generate_video(
         temporal_info = f"{tiling_config.temporal_config.tile_size_in_frames}f" if tiling_config.temporal_config else "none"
         console.print(f"[dim]  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}[/]")
         _debug_stats("latents_pre_decode", latents)
-        video = vae_decoder.decode_tiled(latents, tiling_config=tiling_config, tiling_mode=tiling, debug=verbose, on_frames_ready=on_frames_ready)
     else:
         console.print("[dim]  Tiling: disabled[/]")
         _debug_stats("latents_pre_decode", latents)
-        video = vae_decoder(latents)
-    mx.eval(video)
-    mx.clear_cache()
+
+    with phase_timer.phase("vae_decode"):
+        if tiling_config is not None:
+            # Auto tiling is conservative for many M-chip configs; try a fast non-tiled
+            # decode first and fall back to tiling on Metal OOM/resource errors.
+            if tiling == "auto" and not stream:
+                try:
+                    console.print("[dim]  Auto tiling: trying non-tiled decode (fast path)[/]")
+                    video = vae_decoder(latents, chunked_conv=False)
+                except Exception as exc:
+                    if not _looks_like_metal_oom(exc):
+                        raise
+                    console.print("[yellow]⚠️  Non-tiled decode failed; retrying with chunked conv[/]")
+                    try:
+                        video = vae_decoder(latents, chunked_conv=True)
+                    except Exception as exc2:
+                        if not _looks_like_metal_oom(exc2):
+                            raise
+                        console.print("[yellow]⚠️  Chunked decode failed; falling back to tiled decode[/]")
+                        video = vae_decoder.decode_tiled(
+                            latents,
+                            tiling_config=tiling_config,
+                            tiling_mode=tiling,
+                            debug=verbose,
+                            on_frames_ready=on_frames_ready,
+                        )
+            else:
+                video = vae_decoder.decode_tiled(
+                    latents,
+                    tiling_config=tiling_config,
+                    tiling_mode=tiling,
+                    debug=verbose,
+                    on_frames_ready=on_frames_ready,
+                )
+        else:
+            video = vae_decoder(latents, chunked_conv=False)
+        mx.eval(video)
+        mx.clear_cache()
 
     # Close stream writer
     if video_writer is not None:
@@ -2551,27 +3061,30 @@ def generate_video(
             final_stream_path = output_path
         stream_video_path = final_stream_path
         console.print(f"[green]✅ Streamed video to[/] {final_stream_path}")
-        video = mx.squeeze(video, axis=0)
-        video = mx.transpose(video, (1, 2, 3, 0))
-        video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
-        video = (video * 255).astype(mx.uint8)
-        video_np = np.array(video)
-        if crop_params is not None:
-            top, left, out_h, out_w = crop_params
-            video_np = video_np[:, top : top + out_h, left : left + out_w, :]
+        with phase_timer.phase("to_uint8_numpy"):
+            video = mx.squeeze(video, axis=0)
+            video = mx.transpose(video, (1, 2, 3, 0))
+            video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
+            video = (video * 255).astype(mx.uint8)
+            video_np = np.array(video)
+            if crop_params is not None:
+                top, left, out_h, out_w = crop_params
+                video_np = video_np[:, top : top + out_h, left : left + out_w, :]
         if not final_stream_path.exists():
             console.print(f"[yellow]⚠️  Stream output missing; re-encoding video to {final_stream_path}[/]")
-            _write_video_cv2(video_np, final_stream_path, fps, console=console)
+            with phase_timer.phase("video_write"):
+                _write_video(video_np, final_stream_path, fps, console=console, encoder=video_encoder)
             stream_video_path = final_stream_path
     else:
-        video = mx.squeeze(video, axis=0)
-        video = mx.transpose(video, (1, 2, 3, 0))
-        video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
-        video = (video * 255).astype(mx.uint8)
-        video_np = np.array(video)
-        if crop_params is not None:
-            top, left, out_h, out_w = crop_params
-            video_np = video_np[:, top : top + out_h, left : left + out_w, :]
+        with phase_timer.phase("to_uint8_numpy"):
+            video = mx.squeeze(video, axis=0)
+            video = mx.transpose(video, (1, 2, 3, 0))
+            video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
+            video = (video * 255).astype(mx.uint8)
+            video_np = np.array(video)
+            if crop_params is not None:
+                top, left, out_h, out_w = crop_params
+                video_np = video_np[:, top : top + out_h, left : left + out_w, :]
 
         if audio:
             temp_video_path = output_path.with_suffix('.temp.mp4')
@@ -2580,7 +3093,8 @@ def generate_video(
             save_path = output_path
 
         try:
-            _write_video_cv2(video_np, save_path, fps, console=console)
+            with phase_timer.phase("video_write"):
+                _write_video(video_np, save_path, fps, console=console, encoder=video_encoder)
             if not audio:
                 console.print(f"[green]✅ Saved video to[/] {output_path}")
         except Exception as e:
@@ -2590,44 +3104,143 @@ def generate_video(
 
     # Decode and save audio if enabled
     audio_np = None
-    if audio and audio_latents is not None:
-        with console.status("[blue]🔊 Decoding audio...[/]", spinner="dots"):
-            audio_decoder = load_audio_decoder(model_path, pipeline, unified_weights=unified_weights)
-            vocoder = load_vocoder(model_path, pipeline, unified_weights=unified_weights)
-            mx.eval(audio_decoder.parameters(), vocoder.parameters())
+    if audio:
+        # If audio was requested but not generated jointly, generate it now via
+        # an AudioOnly pass (typically with dev weights) and then mux into MP4.
+        if audio_latents is None and separate_audio:
+            if audio_steps < 1 or audio_steps > (len(STAGE_1_SIGMAS) - 1):
+                raise ValueError("--audio-steps must be between 1 and 8.")
+            if audio_frames is None:
+                raise RuntimeError("audio_frames was not computed for separate audio generation")
 
-            mel_spectrogram = audio_decoder(audio_latents)
-            audio_waveform = vocoder(mel_spectrogram)
-            mx.eval(audio_waveform)
+            audio_ctx = audio_embeddings
+            if audio_ctx is None and audio_embeddings_pos is not None:
+                audio_ctx = audio_embeddings_pos
+            if audio_ctx is None:
+                raise RuntimeError("Audio embeddings are missing; cannot generate separate audio.")
 
-            audio_np = np.array(audio_waveform.astype(mx.float32))
-            if audio_np.ndim == 3:
-                audio_np = audio_np[0]
+            inferred_audio_repo = audio_model_repo
+            if inferred_audio_repo is None:
+                inferred_audio_repo = model_repo
+                if "distilled" in str(model_repo).lower() and "dev" not in str(model_repo).lower():
+                    inferred_audio_repo = str(model_repo).replace("distilled", "dev")
 
-            del audio_decoder, vocoder
-            mx.clear_cache()
-        console.print("[green]✓[/] Audio decoded")
+            audio_model_path = get_model_path(inferred_audio_repo, require_files=False)
+            audio_weight_candidates = [
+                audio_model_path / "ltx-2-19b-dev-mlx.safetensors",
+                audio_model_path / "ltx-2-19b-dev.safetensors",
+                audio_model_path / "ltx-2-19b-distilled-mlx.safetensors",
+                audio_model_path / "ltx-2-19b-distilled.safetensors",
+                model_path / "ltx-2-19b-dev-mlx.safetensors",
+                model_path / "ltx-2-19b-dev.safetensors",
+                model_path / "ltx-2-19b-distilled-mlx.safetensors",
+                model_path / "ltx-2-19b-distilled.safetensors",
+            ]
+            audio_weights_path = next((p for p in audio_weight_candidates if p.exists()), None)
+            if audio_weights_path is None:
+                raise FileNotFoundError("Could not find transformer weights for separate audio generation.")
 
-        audio_path = Path(output_audio_path) if output_audio_path else output_path.with_suffix('.wav')
-        save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
-        console.print(f"[green]✅ Saved audio to[/] {audio_path}")
+            with phase_timer.phase("audio_generate"):
+                console.print(f"\n[bold yellow]🎵 Audio:[/] Generating separately ({audio_steps} steps)")
+                with console.status("[blue]🎵 Loading audio transformer...[/]", spinner="dots"):
+                    audio_config = LTXModelConfig(
+                        model_type=LTXModelType.AudioOnly,
+                        # Keep video config defaults (unused) for parity with saved weights.
+                        num_attention_heads=32,
+                        attention_head_dim=128,
+                        in_channels=128,
+                        out_channels=128,
+                        num_layers=48,
+                        cross_attention_dim=4096,
+                        caption_channels=3840,
+                        rope_type=LTXRopeType.SPLIT,
+                        double_precision_rope=True,
+                        positional_embedding_theta=10000.0,
+                        positional_embedding_max_pos=[20, 2048, 2048],
+                        use_middle_indices_grid=True,
+                        timestep_scale_multiplier=1000,
+                        # Audio config (used)
+                        audio_num_attention_heads=32,
+                        audio_attention_head_dim=64,
+                        audio_in_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
+                        audio_out_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
+                        audio_cross_attention_dim=2048,
+                        audio_positional_embedding_max_pos=[20],
+                    )
+                    audio_transformer = LTXModel.from_pretrained(
+                        model_path=audio_weights_path,
+                        config=audio_config,
+                        strict=False,
+                    )
+                console.print("[green]✓[/] Audio transformer loaded")
 
-        with console.status("[blue]🎬 Combining video and audio...[/]", spinner="dots"):
-            temp_video_path = stream_video_path or output_path.with_suffix('.temp.mp4')
-            if (not temp_video_path.exists()) or (temp_video_path.exists() and temp_video_path.stat().st_size == 0):
-                console.print(f"[yellow]⚠️  Temp video missing; re-encoding to {temp_video_path}[/]")
-                _write_video_cv2(video_np, temp_video_path, fps, console=console)
-            success = mux_video_audio(temp_video_path, audio_path, output_path)
-        if success:
-            console.print(f"[green]✅ Saved video with audio to[/] {output_path}")
-            if temp_video_path.exists() and temp_video_path != output_path:
-                temp_video_path.unlink()
-        else:
-            if temp_video_path.exists():
-                temp_video_path.rename(output_path)
-                console.print(f"[yellow]⚠️  Saved video without audio to[/] {output_path}")
+                # Reset seed so audio is reproducible regardless of video sampling.
+                mx.random.seed(seed)
+                audio_positions_sep = create_audio_position_grid(1, audio_frames)
+                audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)).astype(model_dtype)
+                mx.eval(audio_positions_sep, audio_latents)
+
+                audio_sigmas_list = _subsample_sigmas(STAGE_1_SIGMAS, audio_steps, sigma_subsample)
+                # Avoid compilation overhead for the short audio loop.
+                audio_latents = denoise_audio_only(
+                    audio_latents,
+                    audio_positions_sep,
+                    audio_ctx,
+                    audio_transformer,
+                    audio_sigmas_list,
+                    verbose=verbose,
+                    eval_interval=eval_interval,
+                    compile_step=False,
+                    compile_shapeless=False,
+                    fp32_euler=fp32_euler,
+                )
+                del audio_transformer
+                mx.clear_cache()
+
+        if audio_latents is not None:
+            with phase_timer.phase("audio_decode"):
+                with console.status("[blue]🔊 Decoding audio...[/]", spinner="dots"):
+                    audio_decoder = load_audio_decoder(model_path, pipeline, unified_weights=unified_weights)
+                    vocoder = load_vocoder(model_path, pipeline, unified_weights=unified_weights)
+                    mx.eval(audio_decoder.parameters(), vocoder.parameters())
+
+                    mel_spectrogram = audio_decoder(audio_latents)
+                    audio_waveform = vocoder(mel_spectrogram)
+                    mx.eval(audio_waveform)
+
+                    audio_np = np.array(audio_waveform.astype(mx.float32))
+                    if audio_np.ndim == 3:
+                        audio_np = audio_np[0]
+
+                    del audio_decoder, vocoder
+                    mx.clear_cache()
+                console.print("[green]✓[/] Audio decoded")
+
+            audio_path = Path(output_audio_path) if output_audio_path else output_path.with_suffix('.wav')
+            with phase_timer.phase("audio_save"):
+                save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
+            console.print(f"[green]✅ Saved audio to[/] {audio_path}")
+
+            with phase_timer.phase("audio_mux"):
+                with console.status("[blue]🎬 Combining video and audio...[/]", spinner="dots"):
+                    temp_video_path = stream_video_path or output_path.with_suffix('.temp.mp4')
+                    if (not temp_video_path.exists()) or (temp_video_path.exists() and temp_video_path.stat().st_size == 0):
+                        console.print(f"[yellow]⚠️  Temp video missing; re-encoding to {temp_video_path}[/]")
+                        with phase_timer.phase("video_write"):
+                            _write_video(video_np, temp_video_path, fps, console=console, encoder=video_encoder)
+                    success = mux_video_audio(temp_video_path, audio_path, output_path)
+            if success:
+                console.print(f"[green]✅ Saved video with audio to[/] {output_path}")
+                if temp_video_path.exists() and temp_video_path != output_path:
+                    temp_video_path.unlink()
             else:
-                console.print("[yellow]⚠️  Audio mux failed and temp video missing; leaving output unchanged.[/]")
+                if temp_video_path.exists():
+                    temp_video_path.rename(output_path)
+                    console.print(f"[yellow]⚠️  Saved video without audio to[/] {output_path}")
+                else:
+                    console.print("[yellow]⚠️  Audio mux failed and temp video missing; leaving output unchanged.[/]")
+        else:
+            console.print("[yellow]⚠️  Audio was enabled but no audio latents were produced; saving video without audio.[/]")
 
     del vae_decoder
     if capture_started and capture_phase in ("decode", "all"):
@@ -2652,6 +3265,40 @@ def generate_video(
         f"[bold green]✨ Peak memory:[/] {mx.get_peak_memory() / (1024 ** 3):.2f}GB",
         expand=False
     ))
+    if profile:
+        report = phase_timer.render(elapsed)
+        if report:
+            console.print(Panel(report, title="[bold]Timings[/]", expand=False))
+    if profile_json_path and phase_timer.times_s:
+        try:
+            import json
+
+            out_path = Path(profile_json_path)
+            if profile_json_path == "auto":
+                out_path = output_path.with_suffix(".profile.json")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            payload = {
+                "elapsed_s": float(elapsed),
+                "num_frames": int(num_frames),
+                "fps": float(fps),
+                "pipeline": pipeline.value,
+                "stage1_steps": int(stage1_steps) if is_distilled_pipeline else None,
+                "stage2_steps": int(stage2_steps) if is_distilled_pipeline else None,
+                "eval_interval": int(eval_interval),
+                "compile_step": bool(compile_step),
+                "compile_shapeless": bool(compile_shapeless),
+                "fp32_euler": bool(fp32_euler),
+                "audio": bool(audio),
+                "audio_mode": str(audio_mode),
+                "audio_steps": int(audio_steps) if audio else None,
+                "phases_s": {k: float(v) for k, v in phase_timer.times_s.items()},
+                "peak_memory_gb": float(mx.get_peak_memory() / (1024 ** 3)),
+            }
+            out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            console.print(f"[dim]Wrote profile JSON:[/] {out_path}")
+        except Exception as exc:
+            console.print(f"[yellow]⚠️  Failed to write profile JSON ({exc})[/]")
 
     if clear_cache:
         mx.clear_cache()
@@ -2749,11 +3396,26 @@ Examples:
     parser.add_argument("--frame-rate", type=float, default=None, help="Alias for --fps")
     parser.add_argument("--output-path", "--output", "-o", type=str, default="output.mp4", help="Output video path")
     parser.add_argument("--save-frames", action="store_true", help="Save individual frames as images")
+    parser.add_argument(
+        "--video-encoder",
+        type=str,
+        choices=["cv2", "ffmpeg"],
+        default=os.getenv("LTX_VIDEO_ENCODER", "cv2"),
+        help="Video encoder backend for MP4 writing (default: cv2).",
+    )
     parser.add_argument("--model-repo", type=str, default="Lightricks/LTX-2", help="Model repository")
     parser.add_argument("--text-encoder-repo", type=str, default=None, help="Text encoder repository")
     parser.add_argument("--checkpoint-path", "--checkpoint", type=str, default=None, help="Path to .safetensors checkpoint (optional)")
     parser.add_argument("--gemma-root", "--text-encoder-path", type=str, default=None, help="Path to Gemma text encoder directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--profile", action="store_true", help="Print a timing breakdown for benchmarking")
+    parser.add_argument(
+        "--profile-json",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Write a JSON timing breakdown. Optionally provide a path; default writes next to output as *.profile.json.",
+    )
     parser.add_argument(
         "--lora",
         action=LoraAction,
@@ -2826,14 +3488,21 @@ Examples:
     parser.add_argument(
         "--stage1-steps",
         type=int,
-        default=8,
+        default=None,
         help="(Distilled pipelines) Number of denoising steps in stage 1 (1-8).",
     )
     parser.add_argument(
         "--stage2-steps",
         type=int,
-        default=3,
+        default=None,
         help="(Distilled pipelines) Number of refinement steps in stage 2 (1-3).",
+    )
+    parser.add_argument(
+        "--sigma-subsample",
+        type=str,
+        choices=["uniform", "farthest"],
+        default=os.getenv("LTX_SIGMA_SUBSAMPLE", "farthest"),
+        help="Subsampling method for fixed sigma schedules when reducing steps (default: farthest).",
     )
     parser.add_argument(
         "--conditioning-mode",
@@ -2845,23 +3514,56 @@ Examples:
                         choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
                         help="Tiling mode for VAE decoding")
     parser.add_argument("--stream", action="store_true", help="Stream frames to output as they're decoded")
-    parser.add_argument("--audio", "-a", action="store_true", help="Enable synchronized audio generation")
+    parser.add_argument(
+        "--audio",
+        "-a",
+        action="store_true",
+        help="Enable synchronized audio generation (default: on; use --skip-audio to disable).",
+    )
+    parser.add_argument(
+        "--audio-mode",
+        type=str,
+        choices=["auto", "joint", "separate"],
+        default=os.getenv("LTX_AUDIO_MODE", "auto"),
+        help="Audio strategy when --audio is enabled: auto (default), joint, or separate.",
+    )
+    parser.add_argument(
+        "--audio-model-repo",
+        type=str,
+        default=os.getenv("LTX_AUDIO_MODEL_REPO") or None,
+        help="Optional model repo/directory to use for separate audio transformer weights (dev recommended).",
+    )
+    parser.add_argument(
+        "--audio-steps",
+        type=int,
+        default=int(os.getenv("LTX_AUDIO_STEPS", "8")),
+        help="Number of denoising steps for separate audio generation (1-8).",
+    )
     parser.add_argument("--skip-audio", action="store_true", help="Alias for disabling audio generation")
     parser.add_argument("--output-audio", type=str, default=None, help="Output audio path")
     parser.add_argument("--mem-log", action="store_true", help="Log active/cache/peak memory at key stages")
     parser.add_argument("--clear-cache", action="store_true", help="Clear MLX cache after generation")
     parser.add_argument("--cache-limit-gb", type=float, default=None, help="Set MLX cache limit in GB")
     parser.add_argument("--memory-limit-gb", type=float, default=None, help="Set MLX memory limit in GB")
-    default_eval_interval = int(os.getenv("LTX_EVAL_INTERVAL", "2"))
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=default_eval_interval,
-        help="Evaluate latents every N steps (reduces sync overhead; higher uses more memory)",
+        default=None,
+        help="Evaluate latents every N steps (reduces sync overhead; higher uses more memory). Default: auto.",
     )
+    # Default audio to ON unless the user opts out. Setting LTX_DEFAULT_AUDIO=0
+    # disables this behavior globally, and `--skip-audio` disables per-run.
+    env_default_audio = os.getenv("LTX_DEFAULT_AUDIO", "1").lower() in ("1", "true", "yes")
+    env_fp32_euler = os.getenv("LTX_FP32_EULER", "").lower() not in ("0", "false", "no")
     env_compile = os.getenv("LTX_COMPILE", "").lower() in ("1", "true", "yes")
     env_compile_shapeless = os.getenv("LTX_COMPILE_SHAPELESS", "").lower() in ("1", "true", "yes")
     env_cfg_batch = os.getenv("LTX_CFG_BATCH", "").lower() in ("1", "true", "yes")
+    parser.add_argument(
+        "--fp32-euler",
+        action=argparse.BooleanOptionalAction,
+        default=env_fp32_euler,
+        help="Compute Euler update in float32 for numerical stability (slower). Use --no-fp32-euler for speed.",
+    )
     parser.add_argument(
         "--compile",
         action="store_true",
@@ -2893,9 +3595,28 @@ Examples:
     parser.add_argument("--stg-mode", type=str, choices=["stg_av", "stg_v"], default=None, help="(PyTorch parity) Not implemented in MLX; ignored.")
     args = parser.parse_args()
 
+    if args.profile_json and not args.profile:
+        args.profile = True
+
     # Auto-heuristics for dev-only knobs. Distilled pipelines have fixed schedules,
     # and compile/CFG-batching often add overhead on Apple Metal for short loops.
     is_dev_cli_pipeline = args.pipeline == "dev"
+    if args.stage1_steps is None:
+        # The distilled schedule contains redundant high-sigma steps; with farthest
+        # subsampling, 6 steps is typically indistinguishable from 8 but faster.
+        args.stage1_steps = 6 if args.pipeline == "distilled" else 8
+    if args.stage2_steps is None:
+        # Default: prefer speed for plain distilled runs; keep historical default
+        # (3 steps) for the other two-stage pipelines.
+        args.stage2_steps = 1 if args.pipeline == "distilled" else 3
+    if args.eval_interval is None:
+        env_eval = os.getenv("LTX_EVAL_INTERVAL")
+        if env_eval is not None:
+            args.eval_interval = int(env_eval)
+        else:
+            # Fewer evals reduces CPU-GPU sync overhead; distilled runs tolerate a
+            # slightly higher interval.
+            args.eval_interval = 2 if is_dev_cli_pipeline else 4
 
     if args.frame_rate is not None:
         args.fps = args.frame_rate
@@ -2913,8 +3634,12 @@ Examples:
         args.compile = False
     elif env_compile:
         args.compile = True
-    elif not args.compile and is_dev_cli_pipeline and args.steps >= 8:
-        args.compile = True
+    elif not args.compile:
+        if is_dev_cli_pipeline and args.steps >= 8:
+            args.compile = True
+        elif (not is_dev_cli_pipeline) and args.num_frames >= 97 and (args.stage1_steps + args.stage2_steps) >= 5:
+            # Distilled pipelines: compile pays off mostly for longer clips and non-trivial step counts.
+            args.compile = True
     if not args.compile:
         args.compile_shapeless = False
     elif env_compile_shapeless:
@@ -2932,6 +3657,19 @@ Examples:
 
     if args.skip_audio and args.audio:
         console.print("[yellow]⚠️  --skip-audio overrides --audio[/]")
+    # If the user configured audio-related knobs, assume they want audio even if
+    # they forgot to pass `--audio`. This prevents "missing audio" surprises in
+    # UIs that only set `--audio-mode` or `--output-audio`.
+    if not args.audio and not args.skip_audio:
+        if (
+            args.audio_mode != "auto"
+            or args.audio_model_repo is not None
+            or args.output_audio is not None
+            or args.audio_steps != 8
+        ):
+            args.audio = True
+    if env_default_audio and not args.skip_audio:
+        args.audio = True
     if args.skip_audio:
         args.audio = False
 
@@ -2984,7 +3722,10 @@ Examples:
         fps=args.fps,
         output_path=args.output_path,
         save_frames=args.save_frames,
+        video_encoder=args.video_encoder,
         verbose=args.verbose,
+        profile=args.profile,
+        profile_json_path=args.profile_json,
         enhance_prompt=args.enhance_prompt,
         enhance_prompt_model=None,
         max_tokens=args.max_tokens,
@@ -2999,6 +3740,9 @@ Examples:
         tiling=args.tiling,
         stream=args.stream,
         audio=args.audio,
+        audio_mode=args.audio_mode,
+        audio_model_repo=args.audio_model_repo,
+        audio_steps=args.audio_steps,
         output_audio_path=args.output_audio,
         mem_log=args.mem_log,
         clear_cache=args.clear_cache,
@@ -3008,11 +3752,13 @@ Examples:
         compile_step=args.compile,
         compile_shapeless=args.compile_shapeless,
         cfg_batch=args.cfg_batch,
+        fp32_euler=args.fp32_euler,
         metal_capture=args.metal_capture,
         metal_capture_path=args.metal_capture_path,
         metal_capture_phase=args.metal_capture_phase,
         loras=loras,
         checkpoint_path=args.checkpoint_path,
+        sigma_subsample=args.sigma_subsample,
         auto_output_name=args.auto_output_name,
         output_name_model=auto_output_name_model,
     )
