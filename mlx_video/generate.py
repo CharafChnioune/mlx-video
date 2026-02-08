@@ -25,6 +25,19 @@ from rich.panel import Panel
 # Rich console for styled output
 console = Console()
 
+def _format_eta(seconds: float) -> str:
+    """Format seconds as M:SS or H:MM:SS (matches backend ETA parsing expectations)."""
+    try:
+        seconds_i = int(round(float(seconds)))
+    except Exception:
+        seconds_i = 0
+    seconds_i = max(0, seconds_i)
+    h, rem = divmod(seconds_i, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
 
 class _PhaseTimer:
     """Lightweight phase timer for profiling end-to-end generation."""
@@ -711,6 +724,15 @@ def denoise_distilled(
         disable=not verbose,
     ) as progress:
         task = progress.add_task(desc, total=num_steps)
+        progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
+        try:
+            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+        except Exception:
+            progress_echo_every = 12
+        last_echo_i = -1
+        t0_echo = time.perf_counter()
+        # Strip Rich markup so stdout scraping stays stable.
+        desc_plain = re.sub(r"\[[^\]]+\]", "", desc).strip() or "Denoising"
 
         for i in range(num_steps):
             sigma = sigmas[i]
@@ -790,8 +812,13 @@ def denoise_distilled(
                     mx.eval(latents)
 
             progress.advance(task)
-            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
-                print(f"Denoising {i + 1}/{num_steps}", flush=True)
+            if progress_echo and progress_echo_every > 0:
+                if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
+                    done = i + 1
+                    elapsed = time.perf_counter() - t0_echo
+                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+                    print(f"{desc_plain} {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    last_echo_i = i
 
     _debug_stats("latents_after_denoise_distilled", latents)
     if enable_audio:
@@ -894,6 +921,13 @@ def denoise_audio_only(
         disable=not verbose,
     ) as progress:
         task = progress.add_task("[cyan]Denoising audio[/]", total=num_steps)
+        progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
+        try:
+            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+        except Exception:
+            progress_echo_every = 12
+        last_echo_i = -1
+        t0_echo = time.perf_counter()
 
         for i in range(num_steps):
             sigma_mx = sigmas_mx[i]
@@ -933,8 +967,13 @@ def denoise_audio_only(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(audio_latents)
             progress.advance(task)
-            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
-                print(f"Denoising audio {i + 1}/{num_steps}", flush=True)
+            if progress_echo and progress_echo_every > 0:
+                if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
+                    done = i + 1
+                    elapsed = time.perf_counter() - t0_echo
+                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+                    print(f"Denoising audio {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    last_echo_i = i
 
     _debug_stats("audio_latents_after_denoise_audio_only", audio_latents)
     return audio_latents
@@ -1096,6 +1135,13 @@ def denoise_dev(
         disable=not verbose,
     ) as progress:
         task = progress.add_task("[cyan]Denoising (CFG)[/]", total=num_steps)
+        progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
+        try:
+            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+        except Exception:
+            progress_echo_every = 12
+        last_echo_i = -1
+        t0_echo = time.perf_counter()
 
         for i in range(num_steps):
             sigma = sigmas_list[i]
@@ -1176,8 +1222,13 @@ def denoise_dev(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(latents)
             progress.advance(task)
-            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
-                print(f"Denoising {i + 1}/{num_steps}", flush=True)
+            if progress_echo and progress_echo_every > 0:
+                if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
+                    done = i + 1
+                    elapsed = time.perf_counter() - t0_echo
+                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+                    print(f"Denoising {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    last_echo_i = i
 
     _debug_stats("latents_after_denoise_dev", latents)
     return latents
@@ -1398,6 +1449,13 @@ def denoise_dev_av(
         disable=not verbose,
     ) as progress:
         task = progress.add_task("[cyan]Denoising A/V (CFG)[/]", total=num_steps)
+        progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
+        try:
+            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+        except Exception:
+            progress_echo_every = 12
+        last_echo_i = -1
+        t0_echo = time.perf_counter()
 
         for i in range(num_steps):
             sigma = sigmas_list[i]
@@ -1516,8 +1574,13 @@ def denoise_dev_av(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(video_latents, audio_latents)
             progress.advance(task)
-            if os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1":
-                print(f"Denoising {i + 1}/{num_steps}", flush=True)
+            if progress_echo and progress_echo_every > 0:
+                if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
+                    done = i + 1
+                    elapsed = time.perf_counter() - t0_echo
+                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+                    print(f"Denoising {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    last_echo_i = i
 
     _debug_stats("video_latents_after_denoise_dev_av", video_latents)
     _debug_stats("audio_latents_after_denoise_dev_av", audio_latents)
@@ -2434,7 +2497,9 @@ def generate_video(
 
                 # Read quantization settings from model_path (if available)
                 q_group_size = 64
-                q_bits = 4
+                # Default to repo-name inference when metadata is missing.
+                repo_hint = f"{model_repo}".lower()
+                q_bits = 8 if ("8bit" in repo_hint or "q8" in repo_hint) else 4
                 q_mode = "affine"
                 q_scope = "core"
                 meta_path = model_path / "quantization.json"
@@ -2449,12 +2514,33 @@ def generate_video(
                         q_scope = meta.get("quantize_scope", meta.get("predicate", q_scope))
                     except Exception:
                         pass
+                # Prefer an exact quantization map from the checkpoint itself when possible.
+                # This avoids "snow" artifacts from re-quantizing the wrong set of layers.
+                scale_prefixes: Optional[set[str]] = None
+                try:
+                    from safetensors import safe_open
+
+                    with safe_open(str(transformer_weight_path), framework="numpy") as f:
+                        keys = list(f.keys())
+                        scale_prefixes = {k[:-len(".scales")] for k in keys if k.endswith(".scales")}
+                        # If we don't have explicit metadata, infer "affine" when biases exist.
+                        if not meta_path.exists() and any(k.endswith(".biases") for k in keys):
+                            q_mode = "affine"
+                except Exception:
+                    scale_prefixes = None
 
                 if verbose:
                     console.print(
                         f"[dim]LoRA on quantized model: re-quantizing in-memory "
                         f"(bits={q_bits}, group_size={q_group_size}, mode={q_mode}, scope={q_scope}).[/]"
                     )
+
+                def _scale_predicate(path, module):
+                    if not hasattr(module, "to_quantized"):
+                        return False
+                    if not scale_prefixes:
+                        return False
+                    return path in scale_prefixes
 
                 def _attn1_only_predicate(path, module):
                     if not hasattr(module, "to_quantized"):
@@ -2483,13 +2569,17 @@ def generate_video(
                 def _all_quantizable_predicate(path, module):
                     return hasattr(module, "to_quantized")
 
-                scope = q_scope
-                if scope == "all":
-                    pred = _all_quantizable_predicate
-                elif scope in ("core", "predicate", "scales"):
-                    pred = _core_predicate
+                if scale_prefixes:
+                    # Best-effort "exact match" to the checkpoint quantization layout.
+                    pred = _scale_predicate
                 else:
-                    pred = _attn1_only_predicate
+                    scope = q_scope
+                    if scope == "all":
+                        pred = _all_quantizable_predicate
+                    elif scope in ("core", "predicate", "scales"):
+                        pred = _core_predicate
+                    else:
+                        pred = _attn1_only_predicate
 
                 nn.quantize(
                     transformer_local,
@@ -3030,6 +3120,7 @@ def generate_video(
         except Exception:
             progress_echo_every = preview_every
         last_progress_idx = -1
+        t_decode0 = time.perf_counter()
         preview_pil = None
         if preview_path is not None:
             try:
@@ -3059,7 +3150,10 @@ def generate_video(
                         idx = _start_idx + i
                         if idx == 0 or idx == num_frames - 1 or (idx - last_progress_idx) >= progress_echo_every:
                             try:
-                                print(f"Streaming frames {idx + 1}/{num_frames}", flush=True)
+                                done = idx + 1
+                                elapsed = time.perf_counter() - t_decode0
+                                eta_s = (elapsed / max(1, done)) * max(0, num_frames - done)
+                                print(f"Streaming frames {done}/{num_frames} ETA {_format_eta(eta_s)}", flush=True)
                                 last_progress_idx = idx
                             except Exception:
                                 pass

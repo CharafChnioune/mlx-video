@@ -1,4 +1,5 @@
 .env
+.venv/
 claude.md
 .DS_Store
 **.pyc
