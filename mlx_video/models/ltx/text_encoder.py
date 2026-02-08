@@ -197,7 +197,23 @@ class LanguageModel(nn.Module):
             except Exception:
                 pass
 
-        weight_files = sorted(path.glob("*.safetensors"))
+        # Some snapshots accidentally ship two complete shard sets (for example both
+        # `diffusion_pytorch_model-*.safetensors` and `model-*.safetensors`). Loading
+        # both doubles download size + RAM, and the second set may override weights.
+        # Prefer one canonical set.
+        if (path / "diffusion_pytorch_model.safetensors.index.json").exists():
+            weight_files = sorted(path.glob("diffusion_pytorch_model-*.safetensors"))
+        elif (path / "model.safetensors.index.json").exists():
+            weight_files = sorted(path.glob("model-*.safetensors"))
+        elif (path / "diffusion_pytorch_model.safetensors").exists():
+            weight_files = [path / "diffusion_pytorch_model.safetensors"]
+        elif (path / "model.safetensors").exists():
+            weight_files = [path / "model.safetensors"]
+        else:
+            weight_files = sorted(path.glob("*.safetensors"))
+        if not weight_files:
+            # Snapshot may be partially downloaded; fall back to any available shards.
+            weight_files = sorted(path.glob("*.safetensors"))
         config_dict = {}
         if config_file.exists():
             with open(config_file, "r") as f:

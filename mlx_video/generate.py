@@ -726,7 +726,12 @@ def denoise_distilled(
         task = progress.add_task(desc, total=num_steps)
         progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
         try:
-            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+            progress_echo_every = int(
+                os.environ.get(
+                    "MLX_VIDEO_DENOISE_ECHO_EVERY",
+                    os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"),
+                )
+            )
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
@@ -923,7 +928,12 @@ def denoise_audio_only(
         task = progress.add_task("[cyan]Denoising audio[/]", total=num_steps)
         progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
         try:
-            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+            progress_echo_every = int(
+                os.environ.get(
+                    "MLX_VIDEO_DENOISE_ECHO_EVERY",
+                    os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"),
+                )
+            )
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
@@ -1137,7 +1147,12 @@ def denoise_dev(
         task = progress.add_task("[cyan]Denoising (CFG)[/]", total=num_steps)
         progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
         try:
-            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+            progress_echo_every = int(
+                os.environ.get(
+                    "MLX_VIDEO_DENOISE_ECHO_EVERY",
+                    os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"),
+                )
+            )
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
@@ -1451,7 +1466,12 @@ def denoise_dev_av(
         task = progress.add_task("[cyan]Denoising A/V (CFG)[/]", total=num_steps)
         progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
         try:
-            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"))
+            progress_echo_every = int(
+                os.environ.get(
+                    "MLX_VIDEO_DENOISE_ECHO_EVERY",
+                    os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", "12"),
+                )
+            )
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
@@ -1794,8 +1814,14 @@ def _write_video(
 ) -> None:
     """Write video using the selected encoder ("cv2" or "ffmpeg")."""
     if encoder == "ffmpeg":
-        _write_video_ffmpeg(video_np, path, fps, console=console)
-        return
+        try:
+            _write_video_ffmpeg(video_np, path, fps, console=console)
+            return
+        except Exception:
+            # If ffmpeg is unavailable or fails, fall back to cv2 so generation can
+            # still complete (even if quality controls are reduced).
+            if console:
+                console.print("[yellow]⚠️  Falling back to OpenCV video encoding.[/]")
     _write_video_cv2(video_np, path, fps, console=console)
 
 
@@ -2279,13 +2305,8 @@ def generate_video(
         if _unified_subset("vae_decoder.") is not None:
             _debug_log(f"vae_source=unified {unified_path}")
             return unified_path
-        # Prefer full (non-MLX) weights inside the same repo (contains VAE stats/decoder).
-        base_weight = model_path / weight_file
-        if base_weight.exists():
-            _debug_log(f"vae_source=base_weight {base_weight}")
-            return base_weight
         # Fall back to dedicated VAE weights inside the selected model repo,
-        # but prefer a known-good base VAE for quantized snapshots if provided.
+        # but avoid cross-repo fallbacks by default (they can trigger huge downloads).
         if (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
             if (model_path / "quantization.json").exists():
                 override_repo = os.environ.get("LTX_VAE_REPO")
@@ -2298,16 +2319,28 @@ def generate_video(
                             return override_weight
                     except Exception as exc:
                         _debug_log(f"vae_source override error: {exc}")
-                try:
-                    base_path = get_model_path("Lightricks/LTX-2", require_files=False)
-                    base_weight_fallback = Path(base_path) / weight_file
-                    if base_weight_fallback.exists():
-                        _debug_log(f"vae_source=base_fallback {base_weight_fallback}")
-                        return base_weight_fallback
-                except Exception as exc:
-                    _debug_log(f"vae_source base fallback error: {exc}")
+                # Optional: allow users to explicitly opt into using the base VAE from Lightricks.
+                # This can improve decode quality for some third-party conversions, but it may
+                # require downloading very large checkpoints. Keep it off by default.
+                if os.environ.get("LTX_USE_BASE_VAE") == "1":
+                    try:
+                        base_path = get_model_path("Lightricks/LTX-2", require_files=False)
+                        base_weight_fallback = Path(base_path) / weight_file
+                        if base_weight_fallback.exists():
+                            _debug_log(f"vae_source=base_fallback {base_weight_fallback}")
+                            return base_weight_fallback
+                    except Exception as exc:
+                        _debug_log(f"vae_source base fallback error: {exc}")
             _debug_log(f"vae_source=repo_vae {model_path}")
             return model_path
+        # Prefer full (non-MLX) weights inside the same repo (contains VAE stats/decoder).
+        # NOTE: Quantized MLX weight files (e.g. `*-mlx.safetensors`) often do NOT include
+        # the VAE stats/decoder, so we only use this fallback when a dedicated `vae/` folder
+        # is missing.
+        base_weight = model_path / weight_file
+        if base_weight.exists():
+            _debug_log(f"vae_source=base_weight {base_weight}")
+            return base_weight
         # If an explicit checkpoint is provided and isn't the quantized MLX file, use it.
         if explicit_weight_path and explicit_weight_path.exists():
             if not explicit_weight_path.name.endswith("-mlx.safetensors"):
@@ -2450,7 +2483,7 @@ def generate_video(
             if not transformer_weights:
                 transformer_weights = None
         if lora_list:
-            from mlx_video.lora import LoraSpec, apply_lora_to_weights, has_quantized_weights
+            from mlx_video.lora import LoraSpec, apply_lora_to_weights, apply_lora_to_model, has_quantized_weights
             # Avoid loading huge quantized safetensors just to detect quantization.
             # For file-based weights, scan the safetensors header for `.scales`/`.biases` keys.
             is_quantized = False
@@ -2468,126 +2501,18 @@ def generate_video(
                     is_quantized = has_quantized_weights(mx.load(str(transformer_weight_path)))
 
             if is_quantized:
-                # Quantized weights + per-run LoRA: re-quantize in-memory using float weights
-                float_weight_path = model_path / weight_file
-                if not float_weight_path.exists():
-                    float_weight_path = weight_file_path
-                if not float_weight_path.exists():
-                    # Fallback: use base LTX-2 float weights for LoRA merge
-                    try:
-                        from mlx_video.utils import get_model_path
-                        base_model_path = get_model_path("Lightricks/LTX-2")
-                        candidate = base_model_path / weight_file
-                        if candidate.exists():
-                            float_weight_path = candidate
-                    except Exception:
-                        pass
-                if not float_weight_path.exists():
-                    raise ValueError(
-                        f"LoRA on quantized weights requires float weights at {model_path / weight_file}."
-                    )
-                from mlx_video.convert import sanitize_transformer_weights
-                float_raw = mx.load(str(float_weight_path))
-                weights = sanitize_transformer_weights(float_raw)
+                # Quantized checkpoints already include their quantization layout (`.scales` keys).
+                # Merging LoRA into weights would require dequantize/requantize and frequently
+                # introduces severe artifacts ("snow"). Instead, load the quantized model as-is
+                # and attach runtime LoRA adapters that add a small residual at inference time.
                 lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
-                weights = apply_lora_to_weights(weights, lora_specs, verbose=verbose)
-
-                transformer_local = LTXModel(config)
-                transformer_local.load_weights(list(weights.items()), strict=False)
-
-                # Read quantization settings from model_path (if available)
-                q_group_size = 64
-                # Default to repo-name inference when metadata is missing.
-                repo_hint = f"{model_repo}".lower()
-                q_bits = 8 if ("8bit" in repo_hint or "q8" in repo_hint) else 4
-                q_mode = "affine"
-                q_scope = "core"
-                meta_path = model_path / "quantization.json"
-                if meta_path.exists():
-                    try:
-                        import json
-                        with open(meta_path, "r") as f:
-                            meta = json.load(f)
-                        q_group_size = int(meta.get("group_size", q_group_size))
-                        q_bits = int(meta.get("bits", q_bits))
-                        q_mode = meta.get("mode", q_mode)
-                        q_scope = meta.get("quantize_scope", meta.get("predicate", q_scope))
-                    except Exception:
-                        pass
-                # Prefer an exact quantization map from the checkpoint itself when possible.
-                # This avoids "snow" artifacts from re-quantizing the wrong set of layers.
-                scale_prefixes: Optional[set[str]] = None
-                try:
-                    from safetensors import safe_open
-
-                    with safe_open(str(transformer_weight_path), framework="numpy") as f:
-                        keys = list(f.keys())
-                        scale_prefixes = {k[:-len(".scales")] for k in keys if k.endswith(".scales")}
-                        # If we don't have explicit metadata, infer "affine" when biases exist.
-                        if not meta_path.exists() and any(k.endswith(".biases") for k in keys):
-                            q_mode = "affine"
-                except Exception:
-                    scale_prefixes = None
-
-                if verbose:
-                    console.print(
-                        f"[dim]LoRA on quantized model: re-quantizing in-memory "
-                        f"(bits={q_bits}, group_size={q_group_size}, mode={q_mode}, scope={q_scope}).[/]"
-                    )
-
-                def _scale_predicate(path, module):
-                    if not hasattr(module, "to_quantized"):
-                        return False
-                    if not scale_prefixes:
-                        return False
-                    return path in scale_prefixes
-
-                def _attn1_only_predicate(path, module):
-                    if not hasattr(module, "to_quantized"):
-                        return False
-                    if "transformer_blocks" not in path:
-                        return False
-                    if "audio_" in path or "audio_to_video" in path or "video_to_audio" in path:
-                        return False
-                    if ".attn1" not in path:
-                        return False
-                    return True
-
-                def _core_predicate(path, module):
-                    if not hasattr(module, "to_quantized"):
-                        return False
-                    if "transformer_blocks" not in path:
-                        return False
-                    if ".attn" in path or ".ff" in path:
-                        return True
-                    if "audio_attn" in path or "audio_ff" in path:
-                        return True
-                    if "audio_to_video_attn" in path or "video_to_audio_attn" in path:
-                        return True
-                    return False
-
-                def _all_quantizable_predicate(path, module):
-                    return hasattr(module, "to_quantized")
-
-                if scale_prefixes:
-                    # Best-effort "exact match" to the checkpoint quantization layout.
-                    pred = _scale_predicate
-                else:
-                    scope = q_scope
-                    if scope == "all":
-                        pred = _all_quantizable_predicate
-                    elif scope in ("core", "predicate", "scales"):
-                        pred = _core_predicate
-                    else:
-                        pred = _attn1_only_predicate
-
-                nn.quantize(
-                    transformer_local,
-                    group_size=q_group_size,
-                    bits=q_bits,
-                    mode=q_mode,
-                    class_predicate=pred,
+                transformer_local = LTXModel.from_pretrained(
+                    model_path=unified_path if transformer_weights is not None else transformer_weight_path,
+                    config=config,
+                    strict=False,
+                    weights_override=transformer_weights,
                 )
+                apply_lora_to_model(transformer_local, lora_specs, verbose=verbose)
             else:
                 raw_weights = transformer_weights if transformer_weights is not None else mx.load(str(transformer_weight_path))
                 lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
@@ -2751,7 +2676,18 @@ def generate_video(
         # Upsample latents
         with phase_timer.phase("upsample"):
             with console.status("[magenta]🔍 Upsampling latents 2x...[/]", spinner="dots"):
-                upsampler = load_upsampler(str(model_path / 'ltx-2-spatial-upscaler-x2-1.0.safetensors'))
+                upsampler_path = model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+                try:
+                    upsampler = load_upsampler(str(upsampler_path))
+                except Exception as e:
+                    # Some community repos ship empty placeholder upscaler files (0 bytes).
+                    # Fall back to known-good weights from another LTX-2 repo already cached.
+                    console.print(
+                        f"[yellow]⚠[/] Failed to load spatial upsampler from {upsampler_path} "
+                        f"({type(e).__name__}: {e}). Falling back to distilled-4bit upsampler weights."
+                    )
+                    fallback_path = get_model_path("AITRADER/ltx2-distilled-4bit-mlx")
+                    upsampler = load_upsampler(str(fallback_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"))
                 mx.eval(upsampler.parameters())
 
                 vae_decoder = load_vae_decoder(
@@ -3073,28 +3009,86 @@ def generate_video(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    video_np: np.ndarray | None = None
 
-    # Stream mode
-    video_writer = None
+    # Stream mode (low memory): stream decoded frames into a video encoder as they become available.
     stream_progress = None
+    stream_task = None
     stream_video_path: Path | None = None
+    stream_cv2 = None
+    stream_ffmpeg = None
     writer_height, writer_width = output_height, output_width
     if crop_params is None:
         writer_height, writer_width = height, width
 
     if stream and tiling_config is not None:
-        import cv2
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         stream_output_path = output_path.with_suffix('.temp.mp4') if audio else output_path
-        video_writer = cv2.VideoWriter(str(stream_output_path), fourcc, fps, (writer_width, writer_height))
-        if not video_writer.isOpened():
-            console.print(f"[yellow]⚠️  Stream writer failed to open; falling back to non-stream write[/]")
-            video_writer.release()
-            video_writer = None
-            stream_progress = None
-            stream_task = None
-        else:
-            stream_video_path = stream_output_path
+        stream_video_path = stream_output_path
+
+        # Prefer ffmpeg pipe encoding when requested (better quality control, avoids cv2 artifacts).
+        if video_encoder == "ffmpeg":
+            try:
+                import subprocess
+
+                ffmpeg = shutil.which("ffmpeg")
+                if ffmpeg is None:
+                    raise FileNotFoundError("ffmpeg not found")
+                stream_crf = int(os.environ.get("LTX_STREAM_CRF", "18"))
+                stream_preset = os.environ.get("LTX_STREAM_PRESET", "veryfast")
+                stream_codec = os.environ.get("LTX_STREAM_CODEC", "libx264")
+
+                cmd = [
+                    ffmpeg,
+                    "-y",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-s",
+                    f"{writer_width}x{writer_height}",
+                    "-r",
+                    str(fps),
+                    "-i",
+                    "-",
+                    "-an",
+                    "-c:v",
+                    stream_codec,
+                    "-preset",
+                    stream_preset,
+                    "-crf",
+                    str(stream_crf),
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(stream_output_path),
+                ]
+                stream_ffmpeg = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                if stream_ffmpeg.stdin is None:
+                    raise RuntimeError("ffmpeg stdin not available")
+            except Exception as exc:
+                console.print(f"[yellow]⚠️  ffmpeg stream writer failed; falling back to OpenCV. ({exc})[/]")
+                stream_ffmpeg = None
+
+        # OpenCV fallback (kept for environments without ffmpeg).
+        if stream_ffmpeg is None:
+            import cv2
+
+            for codec in ("avc1", "mp4v"):
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(str(stream_output_path), fourcc, fps, (writer_width, writer_height))
+                if out.isOpened():
+                    stream_cv2 = out
+                    break
+                out.release()
+            if stream_cv2 is None:
+                console.print("[yellow]⚠️  Stream writer failed to open; falling back to non-stream write[/]")
+                stream_video_path = None
+
+        if stream_video_path is not None and (stream_cv2 is not None or stream_ffmpeg is not None):
             stream_progress = Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -3116,7 +3110,12 @@ def generate_video(
         last_preview_idx = -1
         progress_echo = os.environ.get("MLX_VIDEO_PROGRESS_ECHO") == "1"
         try:
-            progress_echo_every = int(os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", str(preview_every)))
+            progress_echo_every = int(
+                os.environ.get(
+                    "MLX_VIDEO_DECODE_ECHO_EVERY",
+                    os.environ.get("MLX_VIDEO_PROGRESS_ECHO_EVERY", str(preview_every)),
+                )
+            )
         except Exception:
             progress_echo_every = preview_every
         last_progress_idx = -1
@@ -3138,12 +3137,49 @@ def generate_video(
             frames = (frames * 255).astype(mx.uint8)
             frames_np = np.array(frames)
 
-            if video_writer is not None:
-                if crop_params is not None:
-                    top, left, out_h, out_w = crop_params
-                    frames_np = frames_np[:, top : top + out_h, left : left + out_w, :]
+            if crop_params is not None:
+                top, left, out_h, out_w = crop_params
+                frames_np = frames_np[:, top : top + out_h, left : left + out_w, :]
+
+            # NOTE: `frames_np` is RGB uint8 (HWC). OpenCV expects BGR while ffmpeg rawvideo
+            # expects the RGB bytes as-is ("rgb24").
+            if stream_ffmpeg is not None and stream_ffmpeg.stdin is not None:
                 for i, frame in enumerate(frames_np):
-                    video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    try:
+                        stream_ffmpeg.stdin.write(frame.tobytes(order="C"))
+                    except Exception:
+                        # If ffmpeg dies mid-stream, stop writing frames. We'll fall back later.
+                        break
+
+                    if stream_progress is not None and stream_task is not None:
+                        stream_progress.advance(stream_task)
+                    if progress_echo and progress_echo_every > 0:
+                        idx = _start_idx + i
+                        if idx == 0 or idx == num_frames - 1 or (idx - last_progress_idx) >= progress_echo_every:
+                            try:
+                                done = idx + 1
+                                elapsed = time.perf_counter() - t_decode0
+                                eta_s = (elapsed / max(1, done)) * max(0, num_frames - done)
+                                print(f"Streaming frames {done}/{num_frames} ETA {_format_eta(eta_s)}", flush=True)
+                                last_progress_idx = idx
+                            except Exception:
+                                pass
+                    if preview_path is not None and preview_pil is not None and preview_every > 0:
+                        idx = _start_idx + i
+                        if idx == 0 or (idx - last_preview_idx) >= preview_every:
+                            try:
+                                img = preview_pil.fromarray(frame)
+                                if preview_max_dim > 0:
+                                    img.thumbnail((preview_max_dim, preview_max_dim), resample=preview_pil.BILINEAR)
+                                tmp = preview_path.with_suffix(preview_path.suffix + ".tmp")
+                                img.save(str(tmp), format="JPEG", quality=preview_quality, optimize=True)
+                                os.replace(str(tmp), str(preview_path))
+                                last_preview_idx = idx
+                            except Exception:
+                                pass
+            elif stream_cv2 is not None:
+                for i, frame in enumerate(frames_np):
+                    stream_cv2.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                     if stream_progress is not None and stream_task is not None:
                         stream_progress.advance(stream_task)
                     if progress_echo and progress_echo_every > 0:
@@ -3221,8 +3257,30 @@ def generate_video(
         mx.clear_cache()
 
     # Close stream writer
-    if video_writer is not None:
-        video_writer.release()
+    if stream_video_path is not None and (stream_cv2 is not None or stream_ffmpeg is not None):
+        stream_ok = True
+        if stream_cv2 is not None:
+            try:
+                stream_cv2.release()
+            except Exception:
+                stream_ok = False
+        if stream_ffmpeg is not None:
+            try:
+                if stream_ffmpeg.stdin is not None:
+                    stream_ffmpeg.stdin.close()
+                rc = stream_ffmpeg.wait()
+                if rc != 0:
+                    stream_ok = False
+                    err = b""
+                    if stream_ffmpeg.stderr is not None:
+                        err = stream_ffmpeg.stderr.read()
+                    console.print(
+                        f"[yellow]⚠️  ffmpeg stream encode failed (rc={rc}):[/]\n{err.decode(errors='ignore')}"
+                    )
+            except Exception as exc:
+                stream_ok = False
+                console.print(f"[yellow]⚠️  ffmpeg stream encode failed: {exc}[/]")
+
         if stream_progress is not None:
             stream_progress.stop()
         final_stream_path = output_path.with_suffix('.temp.mp4') if audio else output_path
@@ -3230,21 +3288,34 @@ def generate_video(
         if not final_stream_path.exists() and output_path.exists():
             final_stream_path = output_path
         stream_video_path = final_stream_path
-        console.print(f"[green]✅ Streamed video to[/] {final_stream_path}")
-        with phase_timer.phase("to_uint8_numpy"):
-            video = mx.squeeze(video, axis=0)
-            video = mx.transpose(video, (1, 2, 3, 0))
-            video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
-            video = (video * 255).astype(mx.uint8)
-            video_np = np.array(video)
-            if crop_params is not None:
-                top, left, out_h, out_w = crop_params
-                video_np = video_np[:, top : top + out_h, left : left + out_w, :]
-        if not final_stream_path.exists():
-            console.print(f"[yellow]⚠️  Stream output missing; re-encoding video to {final_stream_path}[/]")
+
+        stream_output_ok = (
+            stream_ok
+            and final_stream_path.exists()
+            and final_stream_path.stat().st_size > 0
+        )
+
+        # Only materialize full `video_np` if we need it (fallback encode or save_frames).
+        if (not stream_output_ok) or save_frames:
+            with phase_timer.phase("to_uint8_numpy"):
+                video = mx.squeeze(video, axis=0)
+                video = mx.transpose(video, (1, 2, 3, 0))
+                video = mx.clip((video + 1.0) / 2.0, 0.0, 1.0)
+                video = (video * 255).astype(mx.uint8)
+                video_np = np.array(video)
+                if crop_params is not None:
+                    top, left, out_h, out_w = crop_params
+                    video_np = video_np[:, top : top + out_h, left : left + out_w, :]
+
+        if not stream_output_ok:
+            console.print(f"[yellow]⚠️  Stream output missing/invalid; encoding video to {final_stream_path}[/]")
+            if video_np is None:
+                raise RuntimeError("Stream output invalid and video frames unavailable for fallback encoding")
             with phase_timer.phase("video_write"):
                 _write_video(video_np, final_stream_path, fps, console=console, encoder=video_encoder)
             stream_video_path = final_stream_path
+
+        console.print(f"[green]✅ Streamed video to[/] {stream_video_path}")
     else:
         with phase_timer.phase("to_uint8_numpy"):
             video = mx.squeeze(video, axis=0)
@@ -3271,6 +3342,15 @@ def generate_video(
             console.print(f"[red]❌ Could not save video: {e}[/]")
         if audio:
             stream_video_path = save_path
+
+    # Free decoded video tensor as early as possible. At this point:
+    # - the temp/final MP4 has been written (streamed or non-streamed)
+    # - any optional `video_np` needed for fallbacks or save_frames has been materialized
+    try:
+        del video
+    except Exception:
+        pass
+    mx.clear_cache()
 
     # Decode and save audio if enabled
     audio_np = None

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Tuple, Optional, Any
 
 import mlx.core as mx
+import mlx.nn as nn
 from safetensors import safe_open
 
 
@@ -128,3 +129,147 @@ def apply_lora_to_weights(
 
 def has_quantized_weights(weights: Dict[str, mx.array]) -> bool:
     return any(k.endswith(".scales") or k.endswith(".biases") for k in weights)
+
+
+def _strip_known_prefixes(path: str) -> str:
+    if path.startswith("model.diffusion_model."):
+        return path[len("model.diffusion_model.") :]
+    if path.startswith("diffusion_model."):
+        return path[len("diffusion_model.") :]
+    if path.startswith("model."):
+        return path[len("model.") :]
+    return path
+
+
+def _to_module_path(weight_key: str) -> str:
+    """Convert a weight key like `...to_q.weight` into a module path `...to_q`."""
+    key = _strip_known_prefixes(weight_key)
+    if key.endswith(".weight"):
+        key = key[: -len(".weight")]
+    return key
+
+
+def _get_by_path(root: Any, path: str) -> Any:
+    cur = root
+    if not path:
+        return cur
+    for part in path.split("."):
+        if part.isdigit():
+            cur = cur[int(part)]
+        else:
+            cur = getattr(cur, part)
+    return cur
+
+
+def _set_by_path(root: Any, path: str, value: Any) -> None:
+    parts = path.split(".")
+    if not parts:
+        raise ValueError("Empty module path")
+    parent_path = ".".join(parts[:-1])
+    name = parts[-1]
+    parent = _get_by_path(root, parent_path) if parent_path else root
+    if name.isdigit():
+        parent[int(name)] = value
+    else:
+        setattr(parent, name, value)
+
+
+def _looks_like_linear(m: Any) -> bool:
+    # LoRA adapters are defined for linear projections (2D weight matrices).
+    w = getattr(m, "weight", None)
+    if w is not None and getattr(w, "ndim", 0) == 2:
+        return True
+    scales = getattr(m, "scales", None)
+    if scales is not None and getattr(scales, "ndim", 0) == 2:
+        return True
+    return False
+
+
+class LoRAAdapter(nn.Module):
+    """Runtime LoRA wrapper for MLX modules.
+
+    This avoids in-place merges that break quantized checkpoints (4/8-bit) and can
+    introduce severe artifacts ("snow") if the quantization layout is not identical.
+    """
+
+    def __init__(self, base: nn.Module):
+        super().__init__()
+        self.base = base
+        self._pairs: list[tuple[mx.array, mx.array, float]] = []
+
+    def add(self, A: mx.array, B: mx.array, strength: float) -> None:
+        # Store raw tensors; compute in float32 at call time for stability.
+        self._pairs.append((A, B, float(strength)))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        y = self.base(x)
+        if not self._pairs:
+            return y
+
+        x_f32 = x.astype(mx.float32)
+        delta = None
+        for A, B, s in self._pairs:
+            # A: (r, in), B: (out, r)
+            a_f32 = A.astype(mx.float32)
+            b_f32 = B.astype(mx.float32)
+            # (..., in) @ (in, r) -> (..., r) -> (..., out)
+            d = mx.matmul(mx.matmul(x_f32, mx.transpose(a_f32)), mx.transpose(b_f32)) * s
+            delta = d if delta is None else (delta + d)
+
+        return y + delta.astype(y.dtype)
+
+
+def apply_lora_to_model(
+    model: nn.Module,
+    lora_specs: Iterable[LoraSpec],
+    verbose: bool = False,
+) -> nn.Module:
+    """Attach LoRA adapters to a loaded model in-place."""
+    available = {p for p, _ in model.named_modules()}
+
+    total_applied = 0
+    for spec in lora_specs:
+        lora_sd = load_lora_state(spec.path)
+        applied = 0
+        skipped = 0
+
+        for base_raw, base_sanitized, A, B in _iter_lora_pairs(lora_sd):
+            target_path = None
+            for candidate in _candidate_weight_keys(base_raw, base_sanitized):
+                mp = _to_module_path(candidate)
+                if mp in available:
+                    target_path = mp
+                    break
+            if target_path is None:
+                skipped += 1
+                continue
+
+            try:
+                mod = _get_by_path(model, target_path)
+            except Exception:
+                skipped += 1
+                continue
+
+            if not _looks_like_linear(mod):
+                skipped += 1
+                continue
+
+            if isinstance(mod, LoRAAdapter):
+                adapter = mod
+            else:
+                adapter = LoRAAdapter(mod)
+                _set_by_path(model, target_path, adapter)
+                available.add(target_path)
+
+            adapter.add(A, B, spec.strength)
+            applied += 1
+
+        total_applied += applied
+        if verbose:
+            print(f"[LoRA] runtime attach {spec.path} applied={applied} skipped={skipped}")
+        elif applied == 0:
+            print(f"[LoRA] Warning: no runtime adapters attached for {spec.path}. Check key mapping.")
+
+    if verbose:
+        print(f"[LoRA] runtime total applied pairs={total_applied}")
+    return model
