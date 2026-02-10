@@ -33,9 +33,10 @@ def _required_model_files() -> list[str]:
 def _has_required_files(path: Path) -> bool:
     if (path / "model.safetensors").exists():
         return True
-    # AITRADER conversions use `ltx-2-19b-*.safetensors` as the main weights.
-    # Treat its presence as sufficient even if some auxiliary files are missing
-    # (older conversions were inconsistent but still runnable).
+    # Some repos ship a single large `ltx-2-19b-*.safetensors` file that already
+    # contains VAE/audio/vocoder weights, without separate `vae/`, `audio_vae/`,
+    # `vocoder/` directories. Treat those as valid installs even if the directory
+    # layout is missing.
     if any(path.glob("ltx-2-19b-*.safetensors")):
         return True
     return all((path / rel).exists() for rel in _required_model_files())
@@ -84,21 +85,22 @@ def get_model_path(model_repo: str, require_files: bool = True):
     
     remote_sha: str | None = None
     try:
-        # If we have a local cached snapshot but the upstream repo moved, using the cached
-        # copy can be massively wasteful (old snapshots sometimes contained duplicate weight
-        # sets). Prefer the latest commit when online.
+        # If we have a local cached snapshot but the upstream repo moved, using the
+        # cached copy can be massively wasteful (old snapshots sometimes contained
+        # duplicate weight sets). Prefer the latest commit when online.
         from huggingface_hub import HfApi
 
         remote_sha = HfApi().model_info(repo_id=alias, files_metadata=False).sha
     except Exception:
         remote_sha = None
 
+    local: Path | None = None
     try:
         local = Path(snapshot_download(repo_id=alias, local_files_only=True))
         if remote_sha and local.name != remote_sha:
             # Stale cached snapshot: force a refresh download below.
             local = None
-        if require_files and not _has_required_files(local):
+        if local is not None and require_files and not _has_required_files(local):
             local = None
         if local is not None and _needs_connectors(alias):
             # Some MLX snapshots ship connectors under different filenames.
@@ -125,19 +127,23 @@ def get_model_path(model_repo: str, require_files: bool = True):
     #   - text_encoder/diffusion_pytorch_model-*.safetensors
     #   - text_encoder/model-*.safetensors
     # Downloading both doubles bandwidth/disk usage (tens of GiB). We pick one.
+    siblings: list[str] = []
     text_encoder_glob = "text_encoder/*.safetensors"
     text_encoder_index = "text_encoder/*.index.json"
     ignore_patterns: list[str] = []
+    weight_patterns: list[str] = []
     try:
         from huggingface_hub import HfApi
 
         api = HfApi()
         info = api.model_info(repo_id=alias, files_metadata=False)
-        te = [
+        siblings = [
             s.rfilename
             for s in (getattr(info, "siblings", None) or [])
-            if s.rfilename.startswith("text_encoder/") and s.rfilename.endswith(".safetensors")
+            if getattr(s, "rfilename", None)
         ]
+
+        te = [p for p in siblings if p.startswith("text_encoder/") and p.endswith(".safetensors")]
         has_diffusers = any(p.startswith("text_encoder/diffusion_pytorch_model") for p in te)
         has_model = any(p.startswith("text_encoder/model") for p in te)
         if has_diffusers:
@@ -160,32 +166,51 @@ def get_model_path(model_repo: str, require_files: bool = True):
                     "text_encoder/diffusion_pytorch_model.safetensors.index.json",
                 ]
             )
+
+        # Tighten the main weight download for AITRADER quant snapshots. Some conversions
+        # accidentally include multiple huge variants (bf16 + quant) in the same repo;
+        # pulling all `ltx-2-*.safetensors` can double the download size.
+        repo_lower = str(alias).lower()
+        kind = "dev" if "dev" in repo_lower else ("distilled" if "distilled" in repo_lower else None)
+        bits = "8bit" if "8bit" in repo_lower else ("4bit" if "4bit" in repo_lower else None)
+        if kind:
+            candidates: list[str] = []
+            if bits:
+                candidates.append(f"ltx-2-19b-{kind}-{bits}-mlx.safetensors")
+            candidates.append(f"ltx-2-19b-{kind}-mlx.safetensors")
+            candidates.append(f"ltx-2-19b-{kind}.safetensors")
+            selected = next((c for c in candidates if c in siblings), None)
+            if selected:
+                weight_patterns.append(selected)
     except Exception:
         # Best-effort only. We'll fall back to downloading any safetensors under text_encoder/.
         pass
+
+    # Weight selection fallback: keep it broad for unknown repos, but prefer explicit
+    # 19B weight filenames for known conversions to avoid downloading duplicates.
+    if not weight_patterns:
+        weight_patterns = [
+            "ltx-2-19b-*.safetensors",
+            "ltx-2-*.safetensors",
+            "ltx2-*.safetensors",
+        ]
 
     if require_files:
         # LTX-2 snapshots can be very large. Limit downloads to the files we need to run
         # generation and avoid pulling duplicate shard sets.
         if _needs_connectors(alias):
             # AITRADER LTX-2 model repos should NOT require a text encoder download; the engine
-            # loads the encoder separately.
-            #
-            # Keep patterns strict: some community repos accidentally include huge, redundant
-            # weight sets (e.g. full PyTorch checkpoints) that match broad globs like
-            # `ltx-2-*.safetensors`, which can balloon downloads to 100+ GiB.
+            # loads the encoder separately. Keep patterns strict to avoid pulling redundant
+            # weight sets that balloon downloads to 100+ GiB.
             allow_patterns = [
                 # Core metadata/config
                 "config.json",
                 "model_index.json",
                 "quantization.json",
                 "layer_report.json",
-                # Main weights (MLX conversions). Do not allow generic `ltx-2-*.safetensors`.
-                "ltx-2-19b-*-mlx.safetensors",
-                "ltx2-19b-*-mlx.safetensors",
-                "ltx-2-*-mlx.safetensors",
-                "ltx2-*-mlx.safetensors",
-                # Upscalers (not MLX-quantized, but required for distilled pipelines).
+                # Main weights (MLX conversions)
+                *weight_patterns,
+                # Upscalers (required for distilled pipelines)
                 "ltx-2-spatial-upscaler-x2-1.0.safetensors",
                 "ltx-2-temporal-upscaler-x2-1.0.safetensors",
                 # Submodules used by video+audio pipelines
@@ -198,16 +223,18 @@ def get_model_path(model_repo: str, require_files: bool = True):
             ]
         else:
             allow_patterns = [
-                # Model weights. Different repos use different conventions.
+                # Model weights. Different repos use different conventions; see `weight_patterns`.
                 "model.safetensors",
-                "ltx-2-*.safetensors",
-                "ltx2-*.safetensors",
+                *weight_patterns,
                 "*.json",
                 "vae/*",
                 "audio_vae/*",
                 "vocoder/*",
                 "connectors/*",
                 "latent_upsampler/*",
+                # Upscalers are required for distilled workflows.
+                "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                "ltx-2-temporal-upscaler-x2-1.0.safetensors",
                 # Text encoder: download only one shard set (see `text_encoder_glob` selection above).
                 "text_encoder/config.json",
                 "text_encoder/generation_config.json",
@@ -242,23 +269,9 @@ def get_model_path(model_repo: str, require_files: bool = True):
 
     max_workers = int(os.environ.get("HF_HUB_MAX_WORKERS", "8"))
 
-    # Print a quick plan so it doesn't look "stuck" before the first bytes arrive.
-    try:
-        plan = snapshot_download(
-            repo_id=alias,
-            local_files_only=False,
-            token=hf_token,
-            max_workers=max_workers,
-            tqdm_class=_PinokioTqdm,
-            allow_patterns=allow_patterns,
-            dry_run=True,
-        )
-        if isinstance(plan, list):
-            # `snapshot_download(dry_run=True)` returns `DryRunFileInfo` objects.
-            total_bytes = sum(getattr(f, "file_size", 0) or 0 for f in plan)
-            print(f"Download plan: {len(plan)} files, {total_bytes / (1024**3):.2f} GiB")
-    except Exception as e:
-        print(f"Download plan unavailable: {e}")
+    # Older huggingface_hub versions (including the one bundled in many Pinokio
+    # environments) do not support `dry_run`. We avoid the pre-flight plan step
+    # to keep logs clean and downloads robust across versions.
 
     downloaded = Path(
         snapshot_download(

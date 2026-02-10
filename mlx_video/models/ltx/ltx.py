@@ -540,7 +540,7 @@ class LTXModel(nn.Module):
         strict: bool = True,
         weights_override: dict | None = None,
     ) -> None:
-        from safetensors import safe_open
+        from mlx.utils import tree_flatten
 
         model = cls(config)
 
@@ -564,20 +564,50 @@ class LTXModel(nn.Module):
             return new_key
 
         def _scan_keys(paths: list[Path]) -> set[str]:
+            """Return safetensors keys without materializing tensors.
+
+            `safetensors.safe_open(..., framework="numpy")` cannot handle BF16 on machines
+            without numpy BF16 support, which caused us to miss quantization metadata and
+            load packed U32 weights into non-quantized modules (manifesting as "snow"/static).
+
+            Parse the safetensors header directly instead.
+            """
+            import json
+            import struct
+
             keys: set[str] = set()
             for p in paths:
                 try:
-                    with safe_open(str(p), framework="numpy") as f:
-                        keys.update(f.keys())
+                    with open(p, "rb") as f:
+                        header_len = struct.unpack("<Q", f.read(8))[0]
+                        header = json.loads(f.read(header_len))
+                    for k in header.keys():
+                        if k != "__metadata__":
+                            keys.add(k)
                 except Exception:
-                    # Best-effort fallback: if this isn't a safetensors file, we cannot cheaply scan keys.
-                    pass
+                    # Best-effort: if this isn't a safetensors file, we cannot cheaply scan keys.
+                    continue
             return keys
 
-        def _maybe_cast(key: str, value: mx.array, has_quant: bool) -> mx.array:
-            if not hasattr(value, "dtype") or value.dtype != mx.float32:
-                return value
+        def _maybe_cast(
+            key: str,
+            value: mx.array,
+            has_quant: bool,
+            quant_aux_dtype: mx.Dtype | None = None,
+        ) -> mx.array:
+            # For pre-quantized checkpoints, `.scales` / `.biases` are part of the
+            # quantization parameters. MLX stores these in the same dtype as the
+            # (unquantized) compute dtype (commonly BF16 for LTX-2 conversions).
+            #
+            # Casting these to FP16 can severely degrade (or break) quantized matmul
+            # output and manifests as "snow"/static videos. Keep the original dtype,
+            # or cast to the dtype declared by `quantization.json` when available.
             if has_quant and (key.endswith(".scales") or key.endswith(".biases")):
+                if quant_aux_dtype is not None and hasattr(value, "dtype") and value.dtype != quant_aux_dtype:
+                    return value.astype(quant_aux_dtype)
+                return value
+
+            if not hasattr(value, "dtype") or value.dtype != mx.float32:
                 return value
             return value.astype(mx.bfloat16)
 
@@ -608,6 +638,8 @@ class LTXModel(nn.Module):
                 f"scales_keys={len(scales_keys)}"
             )
 
+        quant_aux_dtype: mx.Dtype | None = None
+
         # If quantized weights are present, configure quantization before loading.
         if has_quant:
             # Default quant settings; override if quantization.json exists
@@ -625,6 +657,13 @@ class LTXModel(nn.Module):
                     bits = int(meta.get("bits", bits))
                     mode = meta.get("mode", mode)
                     predicate = meta.get("predicate", predicate)
+                    q_dtype = str(meta.get("dtype", "")).lower().strip()
+                    if q_dtype in ("bf16", "bfloat16"):
+                        quant_aux_dtype = mx.bfloat16
+                    elif q_dtype in ("f16", "float16", "fp16"):
+                        quant_aux_dtype = mx.float16
+                    elif q_dtype in ("f32", "float32", "fp32"):
+                        quant_aux_dtype = mx.float32
             except Exception:
                 pass
 
@@ -685,31 +724,161 @@ class LTXModel(nn.Module):
                 q_modules = sum(1 for _, m in model.named_modules() if hasattr(m, "scales"))
                 _debug_log(f"quantized modules={q_modules}")
 
+        # When `strict=True`, `mlx.nn.Module.load_weights()` requires the *complete* set of
+        # model parameters in each call. We want strict correctness (no silent missing keys),
+        # but we also want to:
+        # 1) stream-load large safetensors without aggregating everything into one dict
+        # 2) ignore extra keys present in some checkpoints (e.g. audio weights in a video-only config)
+        #
+        # So we load shards with `strict=False`, track which keys were provided, then validate
+        # the full parameter set at the end.
+        expected_keys: set[str] | None = None
+        loaded_keys: set[str] = set()
+        if strict:
+            expected_keys = set(tree_flatten(model.parameters(), destination={}).keys())
+
+        def _should_load_key(key: str) -> bool:
+            return True if expected_keys is None else key in expected_keys
+
+        def _mark_loaded_key(key: str) -> None:
+            if expected_keys is not None:
+                loaded_keys.add(key)
+
+        def _load_safetensors_stream(weight_file: Path) -> None:
+            """Load safetensors weights without materializing a full dict.
+
+            `mx.load()` returns a dict of *all* tensors, which can temporarily double peak
+            memory for large checkpoints. Here we parse the safetensors header, mmap the
+            file, and load tensors in chunks.
+            """
+            import json
+            import mmap
+            import struct
+
+            import numpy as _np
+
+            chunk_size = int(os.environ.get("LTX_LOAD_CHUNK", "512"))
+            items: list[tuple[str, mx.array]] = []
+
+            with open(weight_file, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+                data_base = 8 + header_len
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    for raw_key, meta in header.items():
+                        if raw_key == "__metadata__":
+                            continue
+
+                        if is_pytorch:
+                            kk = _sanitize_key(raw_key)
+                            if kk is None:
+                                continue
+                        else:
+                            kk = raw_key
+
+                        if not _should_load_key(kk):
+                            continue
+
+                        st_dtype = str(meta.get("dtype", "")).upper()
+                        shape = meta.get("shape") or []
+                        offsets = meta.get("data_offsets")
+                        if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
+                            raise ValueError(f"Invalid data_offsets for {raw_key}")
+                        start = data_base + int(offsets[0])
+                        end = data_base + int(offsets[1])
+                        # NOTE: We intentionally copy to `bytes` here.
+                        # Using memoryview(mmap)[...] can keep an exported pointer alive and
+                        # `mmap.close()` will raise `BufferError` ("exported pointers exist")
+                        # while some intermediate views are still referenced.
+                        buf = mm[start:end]
+
+                        # Read without needing numpy BF16 support: use uint16/uint32 + mx.view().
+                        if st_dtype in ("BF16", "F16"):
+                            raw = _np.frombuffer(buf, dtype=_np.uint16)
+                            arr = mx.array(raw, dtype=mx.uint16)
+                            arr = mx.view(arr, mx.bfloat16 if st_dtype == "BF16" else mx.float16)
+                        elif st_dtype in ("F32", "U32"):
+                            raw = _np.frombuffer(buf, dtype=_np.uint32)
+                            arr = mx.array(raw, dtype=mx.uint32)
+                            if st_dtype == "F32":
+                                arr = mx.view(arr, mx.float32)
+                        else:
+                            raise ValueError(f"Unsupported safetensors dtype: {st_dtype}")
+
+                        if shape:
+                            arr = arr.reshape(tuple(int(x) for x in shape))
+
+                        arr = _maybe_cast(kk, arr, has_quant, quant_aux_dtype=quant_aux_dtype)
+                        _mark_loaded_key(kk)
+                        items.append((kk, arr))
+
+                        if len(items) >= chunk_size:
+                            model.load_weights(items, strict=False)
+                            items.clear()
+                            mx.clear_cache()
+
+                    if items:
+                        model.load_weights(items, strict=False)
+                        items.clear()
+                finally:
+                    mm.close()
+            mx.clear_cache()
+
         if weights_override is not None:
             # Cast in-memory overrides (used for LoRA merges) without duplicating scale/bias dtypes.
             sanitized = {
-                k: _maybe_cast(k, v, has_quant)
+                k: _maybe_cast(k, v, has_quant, quant_aux_dtype=quant_aux_dtype)
                 for k, v in sanitized.items()
             }
-            model.load_weights(list(sanitized.items()), strict=strict)
+            items: list[tuple[str, mx.array]] = []
+            for k, v in sanitized.items():
+                if _should_load_key(k):
+                    _mark_loaded_key(k)
+                    items.append((k, v))
+            # For in-memory overrides we expect a complete set of weights, so we can keep
+            # strict semantics here as well.
+            model.load_weights(items, strict=strict)
         else:
             # Stream-load shards to reduce peak memory: do not aggregate into a huge dict first.
             for weight_file in model_path_list:
+                if str(weight_file).endswith(".safetensors"):
+                    _load_safetensors_stream(Path(weight_file))
+                    continue
+
                 shard = mx.load(str(weight_file))
-                items = []
+                items: list[tuple[str, mx.array]] = []
                 if is_pytorch:
                     for k, v in shard.items():
                         kk = _sanitize_key(k)
                         if kk is None:
                             continue
-                        items.append((kk, _maybe_cast(kk, v, has_quant)))
+                        if not _should_load_key(kk):
+                            continue
+                        v2 = _maybe_cast(kk, v, has_quant, quant_aux_dtype=quant_aux_dtype)
+                        _mark_loaded_key(kk)
+                        items.append((kk, v2))
                 else:
                     for k, v in shard.items():
-                        items.append((k, _maybe_cast(k, v, has_quant)))
+                        if not _should_load_key(k):
+                            continue
+                        v2 = _maybe_cast(k, v, has_quant, quant_aux_dtype=quant_aux_dtype)
+                        _mark_loaded_key(k)
+                        items.append((k, v2))
                 if items:
-                    model.load_weights(items, strict=strict)
+                    # Validate completeness at the end when `strict=True`.
+                    model.load_weights(items, strict=False)
                 del shard
                 mx.clear_cache()
+
+        if expected_keys is not None:
+            missing = expected_keys - loaded_keys
+            if missing:
+                # Keep the message compact; printing thousands of keys is not useful in Pinokio logs.
+                sample = sorted(list(missing))[:20]
+                raise ValueError(
+                    f"Missing {len(missing)} parameters after load (sample: {sample})."
+                )
 
         mx.eval(model.parameters())
         model.eval()

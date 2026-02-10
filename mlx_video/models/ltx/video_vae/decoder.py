@@ -506,7 +506,17 @@ class LTX2VideoDecoder(nn.Module):
 
         if not needs_spatial_tiling and not needs_temporal_tiling:
             # No tiling needed, use regular decode
-            return self(sample, causal=causal, timestep=timestep, debug=debug, chunked_conv=use_chunked_conv)
+            decoded = self(sample, causal=causal, timestep=timestep, debug=debug, chunked_conv=use_chunked_conv)
+            # When running in "stream" mode, the caller may rely on `on_frames_ready` to
+            # incrementally update a UI (preview + progress). Even if tiling isn't needed,
+            # emit a single callback with the fully-decoded tensor so downstream logic
+            # can still iterate frames and report progress.
+            if on_frames_ready is not None:
+                try:
+                    on_frames_ready(decoded, 0)
+                except Exception:
+                    pass
+            return decoded
 
         return decode_with_tiling(
             decoder_fn=self,
@@ -530,6 +540,55 @@ def load_vae_decoder(
     import json
     import os
     from safetensors import safe_open
+
+    def _remap_decoder_key(key: str) -> str:
+        """Map upstream diffusers-style VAE keys onto this MLX decoder's module layout.
+
+        Upstream layout (HF checkpoints):
+        - mid_block.resnets.{i}.*
+        - up_blocks.{0,1,2}.upsamplers.0.*
+        - up_blocks.{0,1,2}.resnets.{i}.*
+
+        MLX layout (this decoder):
+        - up_blocks.0.res_blocks.{i}.*                 (1024ch resblocks)
+        - up_blocks.1.*                               (1024->512 upsample)
+        - up_blocks.2.res_blocks.{i}.*                 (512ch resblocks)
+        - up_blocks.3.*                               (512->256 upsample)
+        - up_blocks.4.res_blocks.{i}.*                 (256ch resblocks)
+        - up_blocks.5.*                               (256->128 upsample)
+        - up_blocks.6.res_blocks.{i}.*                 (128ch resblocks)
+        """
+        parts = key.split(".")
+        if len(parts) < 2:
+            return key
+
+        # mid_block.resnets.{i}.X -> up_blocks.0.res_blocks.{i}.X
+        if len(parts) >= 4 and parts[0] == "mid_block" and parts[1] == "resnets":
+            return ".".join(["up_blocks", "0", "res_blocks", parts[2]] + parts[3:])
+
+        # up_blocks.{b}.(resnets|upsamplers).*
+        if len(parts) >= 3 and parts[0] == "up_blocks":
+            try:
+                b = int(parts[1])
+            except Exception:
+                return key
+
+            # Map upstream decoder up_blocks -> our alternating (upsampler/resblock) indices.
+            # Upstream block b corresponds to:
+            # - our upsampler at (2*b + 1)
+            # - our resblock group at (2*b + 2)
+            upsampler_idx = 2 * b + 1
+            resblock_idx = 2 * b + 2
+
+            if len(parts) >= 4 and parts[2] == "resnets":
+                # up_blocks.b.resnets.i.* -> up_blocks.(2b+2).res_blocks.i.*
+                return ".".join(["up_blocks", str(resblock_idx), "res_blocks", parts[3]] + parts[4:])
+
+            if len(parts) >= 5 and parts[2] == "upsamplers" and parts[3] == "0":
+                # up_blocks.b.upsamplers.0.* -> up_blocks.(2b+1).*
+                return ".".join(["up_blocks", str(upsampler_idx)] + parts[4:])
+
+        return key
 
     def _debug_enabled() -> bool:
         return os.environ.get("LTX_DEBUG") == "1"
@@ -658,6 +717,7 @@ def load_vae_decoder(
                 new_key = new_key.replace(".conv.weight", ".conv.conv.weight")
                 new_key = new_key.replace(".conv.bias", ".conv.conv.bias")
 
+        new_key = _remap_decoder_key(new_key)
         decoder_weights[new_key] = value
 
     print(f"  Found {len(decoder_weights)} decoder weights")
@@ -665,8 +725,16 @@ def load_vae_decoder(
     ts_keys = [k for k in decoder_weights.keys() if "scale_shift" in k or "time_embedder" in k or "timestep_scale" in k]
     print(f"  Found {len(ts_keys)} timestep conditioning weights")
 
-    # Load weights
-    decoder.load_weights(list(decoder_weights.items()), strict=False)
+    # Include per-channel denormalization statistics in the strict load. These are
+    # loaded above and stored on the module, but `load_weights(strict=True)` still
+    # expects them to be present in the provided weight dict.
+    if hasattr(decoder, "latents_mean"):
+        decoder_weights["latents_mean"] = decoder.latents_mean
+    if hasattr(decoder, "latents_std"):
+        decoder_weights["latents_std"] = decoder.latents_std
+
+    # Load weights strictly to avoid silent partial loads (which produce "snow" outputs).
+    decoder.load_weights(list(decoder_weights.items()), strict=True)
 
     print("VAE decoder loaded successfully")
     return decoder

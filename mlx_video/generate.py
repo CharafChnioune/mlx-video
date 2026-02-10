@@ -8,6 +8,7 @@ import os
 import re
 import math
 import time
+import json
 import shutil
 from contextlib import contextmanager
 from enum import Enum
@@ -37,6 +38,27 @@ def _format_eta(seconds: float) -> str:
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _ui_event(payload: dict) -> None:
+    """Emit a single-line JSON progress event for UIs (Pinokio / web frontends).
+
+    This stays off by default and is enabled by setting `MLX_VIDEO_UI_JSON=1` in
+    the environment. The UI can safely parse lines starting with
+    `MLX_VIDEO_UI_EVENT `.
+    """
+
+    if os.environ.get("MLX_VIDEO_UI_JSON") != "1":
+        return
+    try:
+        print(
+            "MLX_VIDEO_UI_EVENT "
+            + json.dumps(payload, separators=(",", ":"), ensure_ascii=True),
+            flush=True,
+        )
+    except Exception:
+        # Never let UI logging break generation.
+        pass
 
 
 class _PhaseTimer:
@@ -539,6 +561,7 @@ def denoise_distilled(
     compile_step: bool = False,
     compile_shapeless: bool = False,
     fp32_euler: bool = True,
+    ui_phase: str = "denoise",
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -735,7 +758,7 @@ def denoise_distilled(
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
-        t0_echo = time.perf_counter()
+        t0 = time.perf_counter()
         # Strip Rich markup so stdout scraping stays stable.
         desc_plain = re.sub(r"\[[^\]]+\]", "", desc).strip() or "Denoising"
 
@@ -817,13 +840,25 @@ def denoise_distilled(
                     mx.eval(latents)
 
             progress.advance(task)
+            done = i + 1
+            elapsed = time.perf_counter() - t0
+            eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+
             if progress_echo and progress_echo_every > 0:
                 if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
-                    done = i + 1
-                    elapsed = time.perf_counter() - t0_echo
-                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
                     print(f"{desc_plain} {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
                     last_echo_i = i
+
+            _ui_event(
+                {
+                    "kind": "progress",
+                    "phase": ui_phase,
+                    "current": done,
+                    "total": num_steps,
+                    "percent": 100.0 * done / max(1, num_steps),
+                    "eta_seconds": float(eta_s),
+                }
+            )
 
     _debug_stats("latents_after_denoise_distilled", latents)
     if enable_audio:
@@ -846,6 +881,7 @@ def denoise_audio_only(
     compile_step: bool = False,
     compile_shapeless: bool = False,
     fp32_euler: bool = True,
+    ui_phase: str = "audio_denoise",
 ) -> mx.array:
     """Run a distilled-style denoising loop for AudioOnly transformers.
 
@@ -937,7 +973,8 @@ def denoise_audio_only(
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
-        t0_echo = time.perf_counter()
+        t0 = time.perf_counter()
+        desc_plain = "Denoising audio"
 
         for i in range(num_steps):
             sigma_mx = sigmas_mx[i]
@@ -977,13 +1014,25 @@ def denoise_audio_only(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(audio_latents)
             progress.advance(task)
+            done = i + 1
+            elapsed = time.perf_counter() - t0
+            eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+
             if progress_echo and progress_echo_every > 0:
                 if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
-                    done = i + 1
-                    elapsed = time.perf_counter() - t0_echo
-                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
-                    print(f"Denoising audio {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    print(f"{desc_plain} {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
                     last_echo_i = i
+
+            _ui_event(
+                {
+                    "kind": "progress",
+                    "phase": ui_phase,
+                    "current": done,
+                    "total": num_steps,
+                    "percent": 100.0 * done / max(1, num_steps),
+                    "eta_seconds": float(eta_s),
+                }
+            )
 
     _debug_stats("audio_latents_after_denoise_audio_only", audio_latents)
     return audio_latents
@@ -1007,6 +1056,7 @@ def denoise_dev(
     compile_step: bool = False,
     compile_shapeless: bool = False,
     cfg_batch: bool = False,
+    ui_phase: str = "denoise",
 ) -> mx.array:
     """Run denoising loop for dev pipeline with CFG."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -1156,7 +1206,8 @@ def denoise_dev(
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
-        t0_echo = time.perf_counter()
+        t0 = time.perf_counter()
+        desc_plain = "Denoising"
 
         for i in range(num_steps):
             sigma = sigmas_list[i]
@@ -1237,13 +1288,25 @@ def denoise_dev(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(latents)
             progress.advance(task)
+            done = i + 1
+            elapsed = time.perf_counter() - t0
+            eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+
             if progress_echo and progress_echo_every > 0:
                 if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
-                    done = i + 1
-                    elapsed = time.perf_counter() - t0_echo
-                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
-                    print(f"Denoising {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    print(f"{desc_plain} {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
                     last_echo_i = i
+
+            _ui_event(
+                {
+                    "kind": "progress",
+                    "phase": ui_phase,
+                    "current": done,
+                    "total": num_steps,
+                    "percent": 100.0 * done / max(1, num_steps),
+                    "eta_seconds": float(eta_s),
+                }
+            )
 
     _debug_stats("latents_after_denoise_dev", latents)
     return latents
@@ -1267,6 +1330,7 @@ def denoise_dev_av(
     compile_step: bool = False,
     compile_shapeless: bool = False,
     cfg_batch: bool = False,
+    ui_phase: str = "denoise",
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG and audio."""
     from mlx_video.models.ltx.rope import precompute_freqs_cis
@@ -1475,7 +1539,8 @@ def denoise_dev_av(
         except Exception:
             progress_echo_every = 12
         last_echo_i = -1
-        t0_echo = time.perf_counter()
+        t0 = time.perf_counter()
+        desc_plain = "Denoising"
 
         for i in range(num_steps):
             sigma = sigmas_list[i]
@@ -1594,13 +1659,25 @@ def denoise_dev_av(
             if (i + 1) % eval_interval == 0 or i == num_steps - 1:
                 mx.eval(video_latents, audio_latents)
             progress.advance(task)
+            done = i + 1
+            elapsed = time.perf_counter() - t0
+            eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
+
             if progress_echo and progress_echo_every > 0:
                 if i == 0 or i == num_steps - 1 or (i - last_echo_i) >= progress_echo_every:
-                    done = i + 1
-                    elapsed = time.perf_counter() - t0_echo
-                    eta_s = (elapsed / max(1, done)) * max(0, num_steps - done)
-                    print(f"Denoising {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
+                    print(f"{desc_plain} {done}/{num_steps} ETA {_format_eta(eta_s)}", flush=True)
                     last_echo_i = i
+
+            _ui_event(
+                {
+                    "kind": "progress",
+                    "phase": ui_phase,
+                    "current": done,
+                    "total": num_steps,
+                    "percent": 100.0 * done / max(1, num_steps),
+                    "eta_seconds": float(eta_s),
+                }
+            )
 
     _debug_stats("video_latents_after_denoise_dev_av", video_latents)
     _debug_stats("audio_latents_after_denoise_dev_av", audio_latents)
@@ -2173,6 +2250,15 @@ def generate_video(
 
     output_path = Path(output_path)
 
+    # Runtime quantization: used to avoid downloading huge/broken "pre-quantized" snapshots
+    # and to reduce memory/speed costs. Defaults match the common AITRADER 4/8-bit conversions.
+    runtime_quantize = False
+    runtime_quantize_bits = int(os.environ.get("LTX_RUNTIME_QUANT_BITS", "8"))
+    runtime_quantize_group_size = int(os.environ.get("LTX_RUNTIME_QUANT_GROUP_SIZE", "64"))
+    runtime_quantize_mode = str(os.environ.get("LTX_RUNTIME_QUANT_MODE", "affine"))
+    runtime_quantize_scope = str(os.environ.get("LTX_RUNTIME_QUANT_SCOPE", "video_core"))
+    prefetched_quant_meta: dict | None = None
+
     # Get model path (HF repo or local directory)
     explicit_weight_path = None
     if checkpoint_path:
@@ -2185,17 +2271,79 @@ def generate_video(
             model_path = candidate.parent
             explicit_weight_path = candidate
     else:
-        model_path = get_model_path(model_repo)
+        # Avoid downloading huge "pre-quantized" snapshots up-front. For known
+        # 4/8-bit preset repos we only need `quantization.json` to decide whether
+        # to use the snapshot directly or fall back to runtime quantization.
+        #
+        # This keeps first-run installs responsive and prevents wasting bandwidth
+        # on broken BF16-quantized community repos.
+        import re
+
+        repo_str = str(model_repo)
+        preset_match = re.search(r"ltx2-(?:dev|distilled)-(4|8)bit-mlx$", repo_str)
+        if preset_match and not Path(repo_str).expanduser().exists():
+            prefetched_qmeta = None
+            try:
+                import json
+                from huggingface_hub import hf_hub_download
+
+                qmeta_file = hf_hub_download(repo_id=repo_str, filename="quantization.json")
+                with open(qmeta_file, "r") as f:
+                    prefetched_qmeta = json.load(f)
+                _debug_log(f"prefetched quantization.json for {repo_str}: {prefetched_qmeta}")
+            except Exception as exc:
+                _debug_log(f"prefetch quantization.json failed for {repo_str}: {exc}")
+
+            # Default to runtime quantization for known 4/8-bit preset repos.
+            #
+            # Rationale:
+            # - Some community "pre-quantized" snapshots are enormous and/or yield severe
+            #   artifacts ("snow"/static). Runtime quantization uses a known-good BF16 base
+            #   model and quantizes deterministically on the user machine.
+            #
+            # Users can opt back into the snapshot by setting `LTX_USE_PREQUANT=1`.
+            use_prequant = os.environ.get("LTX_USE_PREQUANT", "").lower() in ("1", "true", "yes")
+            force_runtime = os.environ.get("LTX_FORCE_RUNTIME_QUANT", "").lower() in ("1", "true", "yes")
+            use_runtime = force_runtime or (not use_prequant)
+
+            if use_runtime:
+                runtime_quantize = True
+                runtime_quantize_bits = int(preset_match.group(1))
+                if prefetched_qmeta:
+                    prefetched_quant_meta = prefetched_qmeta
+                    runtime_quantize_group_size = int(prefetched_qmeta.get("group_size", runtime_quantize_group_size))
+                    runtime_quantize_mode = str(prefetched_qmeta.get("mode", runtime_quantize_mode))
+                    runtime_quantize_scope = str(prefetched_qmeta.get("quantize_scope", runtime_quantize_scope))
+                    # Some conversions used "core" to mean "video core" (not including audio blocks).
+                    if runtime_quantize_scope == "core":
+                        runtime_quantize_scope = "video_core"
+
+                base_repo = os.environ.get(
+                    "LTX_RUNTIME_QUANT_BASE_REPO",
+                    "mlx-community/LTX-2-distilled-bf16" if is_distilled_pipeline else "mlx-community/LTX-2-dev-bf16",
+                )
+                _debug_log(
+                    f"runtime_quantize(preset): repo={repo_str} "
+                    f"bits={runtime_quantize_bits} group_size={runtime_quantize_group_size} "
+                    f"mode={runtime_quantize_mode} scope={runtime_quantize_scope} base_repo={base_repo}"
+                )
+                model_path = get_model_path(base_repo)
+            else:
+                _debug_log(f"using pre-quantized snapshot as-is: repo={repo_str}")
+                model_path = get_model_path(model_repo)
+        else:
+            model_path = get_model_path(model_repo)
 
     _debug_log(
         f"pipeline={pipeline.value} model_repo={model_repo} model_path={model_path} "
         f"checkpoint_path={checkpoint_path}"
     )
 
-    default_text_encoder = os.environ.get(
-        "LTX_TEXT_ENCODER_REPO",
-        "msntest2014/gemma-3-12b-it-abliterated-v2-mlx-4Bit",
-    )
+    # Default to the official LTX-2 repo for the text encoder weights. Some community
+    # conversions (e.g. quantized snapshots) omit `text_encoder/` entirely and rely on
+    # this fallback. Using an unrelated LLM repo here can cause huge downloads and
+    # unstable "snow"/garbled generations.
+    default_text_encoder = os.environ.get("LTX_TEXT_ENCODER_REPO", "Lightricks/LTX-2")
     if text_encoder_repo is None:
         # Prefer bundled text_encoder folder if present; otherwise fall back to default repo.
         if (model_path / "text_encoder").is_dir():
@@ -2207,6 +2355,9 @@ def generate_video(
         text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
 
     _debug_log(f"text_encoder_repo={text_encoder_repo} text_encoder_path={text_encoder_path}")
+    quant_meta = None
+    preferred_dtype: mx.Dtype | None = None
+
     quant_meta_path = model_path / "quantization.json"
     if quant_meta_path.exists():
         try:
@@ -2216,6 +2367,21 @@ def generate_video(
             _debug_log(f"quantization.json={quant_meta}")
         except Exception as exc:
             _debug_log(f"quantization.json read error: {exc}")
+    if quant_meta is None and runtime_quantize and prefetched_quant_meta is not None:
+        quant_meta = prefetched_quant_meta
+        _debug_log(f"quantization.json (prefetched)={quant_meta}")
+    if quant_meta is None and runtime_quantize:
+        # Base BF16 repos usually do not ship quantization metadata. Ensure we still
+        # pin compute dtype for stable runtime quantization.
+        quant_meta = {"dtype": "bfloat16"}
+    if quant_meta:
+        q_dtype = str(quant_meta.get("dtype", "")).lower().strip()
+        if q_dtype in ("bf16", "bfloat16"):
+            preferred_dtype = mx.bfloat16
+        elif q_dtype in ("f16", "float16", "fp16"):
+            preferred_dtype = mx.float16
+        elif q_dtype in ("f32", "float32", "fp32"):
+            preferred_dtype = mx.float32
 
     # Auto-generate a descriptive output name from the prompt (optional)
     if auto_output_name:
@@ -2248,11 +2414,30 @@ def generate_video(
         suffix = output_path.suffix if output_path.suffix else ".mp4"
         output_path = out_dir / f"{safe_name}{suffix}"
 
-    # Model weight file (base PyTorch weights) and optional MLX-converted transformer
+    # Model weight file (base PyTorch weights) and optional MLX-converted transformer.
+    #
+    # Some community repos (including the AITRADER 4/8-bit snapshots) may ship multiple
+    # variants (fp16 + quant) under different filenames. Prefer the most specific match
+    # to avoid accidentally loading the wrong checkpoint (which can manifest as "snow"
+    # artifacts when LoRAs trigger re-quantization).
     weight_file = "ltx-2-19b-dev.safetensors" if is_dev_pipeline else "ltx-2-19b-distilled.safetensors"
     weight_file_path = explicit_weight_path or (model_path / weight_file)
-    mlx_weight_file = model_path / f"ltx-2-19b-{'dev' if is_dev_pipeline else 'distilled'}-mlx.safetensors"
-    transformer_weight_path = explicit_weight_path or (mlx_weight_file if mlx_weight_file.exists() else model_path / weight_file)
+    model_kind = "dev" if is_dev_pipeline else "distilled"
+    repo_hint = f"{model_repo}".lower()
+    bits_hint: str | None = None
+    if any(x in repo_hint for x in ("8bit", "q8", "int8")):
+        bits_hint = "8bit"
+    elif any(x in repo_hint for x in ("4bit", "q4", "int4")):
+        bits_hint = "4bit"
+
+    mlx_weight_candidates: list[Path] = []
+    if bits_hint:
+        mlx_weight_candidates.append(model_path / f"ltx-2-19b-{model_kind}-{bits_hint}-mlx.safetensors")
+    mlx_weight_candidates.append(model_path / f"ltx-2-19b-{model_kind}-mlx.safetensors")
+    mlx_weight_file = next((p for p in mlx_weight_candidates if p.exists()), mlx_weight_candidates[-1])
+    transformer_weight_path = explicit_weight_path or (
+        mlx_weight_file if mlx_weight_file.exists() else model_path / weight_file
+    )
 
     _debug_log(f"weight_file={weight_file} weight_file_path={weight_file_path}")
     _debug_log(f"mlx_weight_file={mlx_weight_file} transformer_weight_path={transformer_weight_path}")
@@ -2301,38 +2486,94 @@ def generate_video(
     mx.random.seed(seed)
 
     def _resolve_vae_source() -> Path:
-        """Resolve a VAE source path for decoding (no cross-repo fallback)."""
+        """Resolve a VAE source path for encoding/decoding.
+
+        Prefer the dedicated VAE weights shipped with the selected model repo. Some
+        conversions (notably quantized snapshots) previously triggered a fallback to
+        the full base LTX-2 checkpoints, which dramatically increases download size
+        and can result in incorrect decoding (e.g. "snow"/static) if the chosen
+        fallback does not actually contain VAE weights.
+        """
+        # Debug/ops override: force VAE from a specific local path or HF repo.
+        # This is useful to isolate "snow"/static issues to either transformer latents
+        # or VAE decoding mismatches.
+        force_vae_path = os.environ.get("LTX_FORCE_VAE_PATH")
+        if force_vae_path:
+            try:
+                forced = Path(force_vae_path).expanduser()
+                if forced.exists():
+                    _debug_log(f"vae_source=force_path {forced}")
+                    return forced
+            except Exception as exc:
+                _debug_log(f"vae_source force_path error: {exc}")
+
+        force_vae_repo = os.environ.get("LTX_FORCE_VAE_REPO")
+        if force_vae_repo:
+            try:
+                forced_root = Path(get_model_path(force_vae_repo, require_files=False))
+                forced_repo_vae = forced_root / "vae" / "diffusion_pytorch_model.safetensors"
+                if forced_repo_vae.exists() and forced_repo_vae.stat().st_size > 0:
+                    _debug_log(f"vae_source=force_repo_vae repo={force_vae_repo} path={forced_root}")
+                    return forced_root
+                for wf in ("ltx-2-19b-dev.safetensors", "ltx-2-19b-distilled.safetensors"):
+                    cand = forced_root / wf
+                    if cand.exists() and cand.stat().st_size > 0:
+                        _debug_log(f"vae_source=force_repo_weight repo={force_vae_repo} path={cand}")
+                        return cand
+            except Exception as exc:
+                _debug_log(f"vae_source force_repo error: {exc}")
+
         if _unified_subset("vae_decoder.") is not None:
             _debug_log(f"vae_source=unified {unified_path}")
             return unified_path
-        # Fall back to dedicated VAE weights inside the selected model repo,
-        # but avoid cross-repo fallbacks by default (they can trigger huge downloads).
-        if (model_path / "vae" / "diffusion_pytorch_model.safetensors").exists():
-            if (model_path / "quantization.json").exists():
-                override_repo = os.environ.get("LTX_VAE_REPO")
-                if override_repo:
-                    try:
-                        override_path = get_model_path(override_repo, require_files=False)
-                        override_weight = Path(override_path) / weight_file
-                        if override_weight.exists():
-                            _debug_log(f"vae_source=override_repo {override_repo} {override_weight}")
-                            return override_weight
-                    except Exception as exc:
-                        _debug_log(f"vae_source override error: {exc}")
-                # Optional: allow users to explicitly opt into using the base VAE from Lightricks.
-                # This can improve decode quality for some third-party conversions, but it may
-                # require downloading very large checkpoints. Keep it off by default.
-                if os.environ.get("LTX_USE_BASE_VAE") == "1":
-                    try:
-                        base_path = get_model_path("Lightricks/LTX-2", require_files=False)
-                        base_weight_fallback = Path(base_path) / weight_file
-                        if base_weight_fallback.exists():
-                            _debug_log(f"vae_source=base_fallback {base_weight_fallback}")
-                            return base_weight_fallback
-                    except Exception as exc:
-                        _debug_log(f"vae_source base fallback error: {exc}")
-            _debug_log(f"vae_source=repo_vae {model_path}")
+        # Prefer dedicated VAE weights inside the selected model repo.
+        repo_vae = model_path / "vae" / "diffusion_pytorch_model.safetensors"
+        if repo_vae.exists():
+            try:
+                if repo_vae.stat().st_size > 8:
+                    _debug_log(f"vae_source=repo_vae {model_path}")
+                    return model_path
+            except Exception:
+                # If stat fails but the path exists, still attempt to load from it.
+                _debug_log(f"vae_source=repo_vae (stat error) {model_path}")
+                return model_path
+
+            # Edge case: placeholder/empty VAE file. Allow an override (best-effort).
+            override_repo = os.environ.get("LTX_VAE_REPO")
+            if override_repo:
+                try:
+                    override_root = Path(get_model_path(override_repo, require_files=False))
+                    override_vae = override_root / "vae" / "diffusion_pytorch_model.safetensors"
+                    if override_vae.exists() and override_vae.stat().st_size > 8:
+                        _debug_log(f"vae_source=override_repo {override_repo} {override_root}")
+                        return override_root
+                    override_weight = override_root / weight_file
+                    if override_weight.exists() and override_weight.stat().st_size > 0:
+                        _debug_log(f"vae_source=override_repo_weight {override_repo} {override_weight}")
+                        return override_weight
+                except Exception as exc:
+                    _debug_log(f"vae_source override error: {exc}")
+
+            # Optional: allow users to explicitly opt into using the base VAE from Lightricks.
+            # This can improve decode quality for some third-party conversions, but it may
+            # require downloading very large checkpoints. Keep it off by default.
+            if os.environ.get("LTX_USE_BASE_VAE") == "1":
+                try:
+                    base_root = Path(get_model_path("Lightricks/LTX-2", require_files=False))
+                    base_vae = base_root / "vae" / "diffusion_pytorch_model.safetensors"
+                    if base_vae.exists() and base_vae.stat().st_size > 8:
+                        _debug_log(f"vae_source=base_repo_vae {base_root}")
+                        return base_root
+                    base_weight_fallback = base_root / weight_file
+                    if base_weight_fallback.exists() and base_weight_fallback.stat().st_size > 0:
+                        _debug_log(f"vae_source=base_fallback {base_weight_fallback}")
+                        return base_weight_fallback
+                except Exception as exc:
+                    _debug_log(f"vae_source base fallback error: {exc}")
+
+            _debug_log(f"vae_source=repo_vae_empty {model_path}")
             return model_path
+
         # Prefer full (non-MLX) weights inside the same repo (contains VAE stats/decoder).
         # NOTE: Quantized MLX weight files (e.g. `*-mlx.safetensors`) often do NOT include
         # the VAE stats/decoder, so we only use this fallback when a dedicated `vae/` folder
@@ -2351,6 +2592,41 @@ def generate_video(
             "Include either `vae/diffusion_pytorch_model.safetensors` "
             "or the full `ltx-2-19b-*.safetensors` in the same repo."
         )
+
+    def _resolve_upsampler_weight(filename: str) -> Path:
+        """Resolve distilled upsampler weights with a safe fallback.
+
+        Some community snapshots contain zero-byte placeholders for these files.
+        Prefer the current repo when it's a real file, otherwise fall back to the
+        official LTX-2 repo (and other known-good snapshots) to avoid runtime read
+        errors.
+        """
+        candidate = model_path / filename
+        try:
+            if candidate.exists() and candidate.stat().st_size > 8:
+                _debug_log(f"upsampler_source=repo {candidate}")
+                return candidate
+        except Exception:
+            if candidate.exists():
+                _debug_log(f"upsampler_source=repo (stat error) {candidate}")
+                return candidate
+
+        for fallback_repo in (
+            "Lightricks/LTX-2",
+            "mlx-community/LTX-2-dev-bf16",
+            "mlx-community/LTX-2-distilled-bf16",
+        ):
+            try:
+                fb_root = Path(get_model_path(fallback_repo, require_files=False))
+                fb = fb_root / filename
+                if fb.exists() and fb.stat().st_size > 8:
+                    _debug_log(f"upsampler_source=fallback repo={fallback_repo} path={fb}")
+                    return fb
+            except Exception:
+                continue
+
+        _debug_log(f"upsampler_source=missing {candidate}")
+        return candidate
 
     enhanced_with_alt = False
 
@@ -2388,7 +2664,15 @@ def generate_video(
             if audio:
                 video_embeddings_pos, audio_embeddings_pos = text_encoder(prompt, return_audio_embeddings=True)
                 video_embeddings_neg, audio_embeddings_neg = text_encoder(negative_prompt, return_audio_embeddings=True)
-                model_dtype = video_embeddings_pos.dtype
+                if preferred_dtype is not None:
+                    video_embeddings_pos = video_embeddings_pos.astype(preferred_dtype)
+                    video_embeddings_neg = video_embeddings_neg.astype(preferred_dtype)
+                    audio_embeddings_pos = audio_embeddings_pos.astype(preferred_dtype)
+                    audio_embeddings_neg = audio_embeddings_neg.astype(preferred_dtype)
+                    model_dtype = preferred_dtype
+                else:
+                    model_dtype = video_embeddings_pos.dtype
+
                 mx.eval(video_embeddings_pos, video_embeddings_neg, audio_embeddings_pos, audio_embeddings_neg)
                 _debug_stats("video_embeddings_pos", video_embeddings_pos)
                 _debug_stats("video_embeddings_neg", video_embeddings_neg)
@@ -2397,7 +2681,12 @@ def generate_video(
             else:
                 video_embeddings_pos, _ = text_encoder(prompt, return_audio_embeddings=False)
                 video_embeddings_neg, _ = text_encoder(negative_prompt, return_audio_embeddings=False)
-                model_dtype = video_embeddings_pos.dtype
+                if preferred_dtype is not None:
+                    video_embeddings_pos = video_embeddings_pos.astype(preferred_dtype)
+                    video_embeddings_neg = video_embeddings_neg.astype(preferred_dtype)
+                    model_dtype = preferred_dtype
+                else:
+                    model_dtype = video_embeddings_pos.dtype
                 mx.eval(video_embeddings_pos, video_embeddings_neg)
                 _debug_stats("video_embeddings_pos", video_embeddings_pos)
                 _debug_stats("video_embeddings_neg", video_embeddings_neg)
@@ -2411,15 +2700,20 @@ def generate_video(
             # Distilled pipeline - single embedding
             if audio:
                 text_embeddings, audio_embeddings = text_encoder(prompt, return_audio_embeddings=True)
+                if preferred_dtype is not None:
+                    text_embeddings = text_embeddings.astype(preferred_dtype)
+                    audio_embeddings = audio_embeddings.astype(preferred_dtype)
                 mx.eval(text_embeddings, audio_embeddings)
                 _debug_stats("text_embeddings", text_embeddings)
                 _debug_stats("audio_embeddings", audio_embeddings)
             else:
                 text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
                 audio_embeddings = None
+                if preferred_dtype is not None:
+                    text_embeddings = text_embeddings.astype(preferred_dtype)
                 mx.eval(text_embeddings)
                 _debug_stats("text_embeddings", text_embeddings)
-            model_dtype = text_embeddings.dtype
+            model_dtype = preferred_dtype or text_embeddings.dtype
 
     del text_encoder
     mx.clear_cache()
@@ -2470,10 +2764,66 @@ def generate_video(
         f"rope_type={config.rope_type} double_precision_rope={config.double_precision_rope}"
     )
 
+    def _runtime_quantize_transformer(transformer_obj: nn.Module, *, label: str) -> None:
+        """Quantize selected transformer blocks in-place for lower memory / faster matmul."""
+
+        def _predicate(path: str, module) -> bool:
+            if not hasattr(module, "to_quantized"):
+                return False
+            if "transformer_blocks" not in path:
+                return False
+            w = getattr(module, "weight", None)
+            if w is not None and hasattr(w, "shape") and (w.shape[0] % 64 != 0):
+                # Skip layers that don't match packing constraints.
+                return False
+
+            scope = str(runtime_quantize_scope or "video_core").lower()
+            if scope in {"attn1", "attn1_only", "attn1-only"}:
+                if "audio_" in path or "audio_to_video" in path or "video_to_audio" in path:
+                    return False
+                return ".attn1" in path
+            if scope in {"video_core", "video-core"}:
+                if "audio_" in path or "audio_to_video" in path or "video_to_audio" in path:
+                    return False
+                return (".attn" in path) or (".ff" in path)
+            if scope == "core":
+                return (
+                    (".attn" in path)
+                    or (".ff" in path)
+                    or ("audio_attn" in path)
+                    or ("audio_ff" in path)
+                    or ("audio_to_video" in path)
+                    or ("video_to_audio" in path)
+                )
+            if scope == "all":
+                return True
+            # Default: video_core
+            if "audio_" in path or "audio_to_video" in path or "video_to_audio" in path:
+                return False
+            return (".attn" in path) or (".ff" in path)
+
+        _debug_log(
+            f"runtime_quantize({label}): bits={runtime_quantize_bits} group_size={runtime_quantize_group_size} "
+            f"mode={runtime_quantize_mode} scope={runtime_quantize_scope}"
+        )
+        nn.quantize(
+            transformer_obj,
+            group_size=int(runtime_quantize_group_size),
+            bits=int(runtime_quantize_bits),
+            mode=str(runtime_quantize_mode),
+            class_predicate=_predicate,
+        )
+        mx.eval(transformer_obj.parameters())
+        transformer_obj.eval()
+        if _debug_enabled():
+            q_modules = sum(1 for _, m in transformer_obj.named_modules() if hasattr(m, "scales"))
+            _debug_log(f"runtime_quantized({label}) modules={q_modules}")
+
     def _load_transformer_with_loras(lora_list: Optional[list[tuple[str, float]]]):
         transformer_local = None
         weights_override = None
         transformer_weights = None
+        runtime_lora_specs = None
         if unified_weights is not None:
             transformer_weights = {
                 k[len("transformer."):]: v
@@ -2486,36 +2836,39 @@ def generate_video(
             from mlx_video.lora import LoraSpec, apply_lora_to_weights, apply_lora_to_model, has_quantized_weights
             # Avoid loading huge quantized safetensors just to detect quantization.
             # For file-based weights, scan the safetensors header for `.scales`/`.biases` keys.
-            is_quantized = False
+            # When we plan to runtime-quantize, treat LoRAs as adapters (no merge) to avoid
+            # quantizing LoRA-merged weights.
+            force_adapter_mode = bool(runtime_quantize)
+            is_quantized = bool(force_adapter_mode)
             if transformer_weights is not None:
-                is_quantized = has_quantized_weights(transformer_weights)
+                is_quantized = is_quantized or has_quantized_weights(transformer_weights)
             else:
                 try:
-                    from safetensors import safe_open
-                    with safe_open(str(transformer_weight_path), framework="numpy") as f:
-                        is_quantized = any(
-                            k.endswith(".scales") or k.endswith(".biases") for k in f.keys()
-                        )
+                    import json
+                    import struct
+
+                    with open(transformer_weight_path, "rb") as f:
+                        header_len = struct.unpack("<Q", f.read(8))[0]
+                        header = json.loads(f.read(header_len))
+                    is_quantized = is_quantized or any(
+                        (k.endswith(".scales") or k.endswith(".biases"))
+                        for k in header.keys()
+                        if k != "__metadata__"
+                    )
                 except Exception:
                     # Fallback to the old behavior (may be memory-heavy).
-                    is_quantized = has_quantized_weights(mx.load(str(transformer_weight_path)))
+                    is_quantized = is_quantized or has_quantized_weights(mx.load(str(transformer_weight_path)))
+
+            lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
 
             if is_quantized:
-                # Quantized checkpoints already include their quantization layout (`.scales` keys).
-                # Merging LoRA into weights would require dequantize/requantize and frequently
-                # introduces severe artifacts ("snow"). Instead, load the quantized model as-is
-                # and attach runtime LoRA adapters that add a small residual at inference time.
-                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
-                transformer_local = LTXModel.from_pretrained(
-                    model_path=unified_path if transformer_weights is not None else transformer_weight_path,
-                    config=config,
-                    strict=False,
-                    weights_override=transformer_weights,
-                )
-                apply_lora_to_model(transformer_local, lora_specs, verbose=verbose)
+                # Quantized base weights: apply LoRA as a runtime residual adapter.
+                # This avoids dequantize/re-quantize cycles that can introduce severe artifacts ("snow").
+                runtime_lora_specs = lora_specs
+                if transformer_weights is not None:
+                    weights_override = transformer_weights
             else:
                 raw_weights = transformer_weights if transformer_weights is not None else mx.load(str(transformer_weight_path))
-                lora_specs = [LoraSpec(Path(path), float(strength)) for path, strength in lora_list]
                 weights_override = apply_lora_to_weights(raw_weights, lora_specs, verbose=verbose)
         elif transformer_weights is not None:
             weights_override = transformer_weights
@@ -2524,9 +2877,18 @@ def generate_video(
             transformer_local = LTXModel.from_pretrained(
                 model_path=unified_path if transformer_weights is not None else transformer_weight_path,
                 config=config,
-                strict=False,
+                # Strict loading is important for quantized weights: missing or mismatched
+                # params will silently produce "snow"/static frames when left uninitialized.
+                strict=True,
                 weights_override=weights_override,
             )
+
+        if runtime_lora_specs:
+            from mlx_video.lora import apply_lora_to_model
+
+            if verbose:
+                console.print("[dim]LoRA on quantized model: attaching runtime adapters (no re-quantization).[/]")
+            apply_lora_to_model(transformer_local, runtime_lora_specs, verbose=verbose)
         return transformer_local
 
     with phase_timer.phase("stage1_transformer_load"):
@@ -2535,6 +2897,13 @@ def generate_video(
 
         console.print("[green]✓[/] Transformer loaded")
     _log_memory("transformer loaded", mem_log)
+
+    if runtime_quantize:
+        with phase_timer.phase("stage1_runtime_quantize"):
+            with console.status("[magenta]🧮 Runtime quantizing stage-1 transformer...[/]", spinner="dots"):
+                _runtime_quantize_transformer(transformer, label="stage1")
+        console.print("[green]✓[/] Stage-1 transformer quantized")
+        _log_memory("stage1 transformer quantized", mem_log)
 
     # ==========================================================================
     # Pipeline-specific generation logic
@@ -2558,7 +2927,7 @@ def generate_video(
             with phase_timer.phase("cond_encode"):
                 with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
                     vae_encoder = load_vae_encoder(
-                        str(weight_file_path),
+                        str(_resolve_vae_source()),
                         weights_override=_unified_subset("vae_encoder."),
                     )
                     mx.eval(vae_encoder.parameters())
@@ -2670,24 +3039,14 @@ def generate_video(
                 compile_step=stage1_compile_effective,
                 compile_shapeless=compile_shapeless,
                 fp32_euler=fp32_euler,
+                ui_phase="stage1",
             )
         _log_memory("stage1 complete", mem_log)
 
         # Upsample latents
         with phase_timer.phase("upsample"):
             with console.status("[magenta]🔍 Upsampling latents 2x...[/]", spinner="dots"):
-                upsampler_path = model_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-                try:
-                    upsampler = load_upsampler(str(upsampler_path))
-                except Exception as e:
-                    # Some community repos ship empty placeholder upscaler files (0 bytes).
-                    # Fall back to known-good weights from another LTX-2 repo already cached.
-                    console.print(
-                        f"[yellow]⚠[/] Failed to load spatial upsampler from {upsampler_path} "
-                        f"({type(e).__name__}: {e}). Falling back to distilled-4bit upsampler weights."
-                    )
-                    fallback_path = get_model_path("AITRADER/ltx2-distilled-4bit-mlx")
-                    upsampler = load_upsampler(str(fallback_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"))
+                upsampler = load_upsampler(str(_resolve_upsampler_weight("ltx-2-spatial-upscaler-x2-1.0.safetensors")))
                 mx.eval(upsampler.parameters())
 
                 vae_decoder = load_vae_decoder(
@@ -2716,7 +3075,11 @@ def generate_video(
 
         if use_stage2_dev and stage2_model_repo is None:
             # Avoid a confusing FileNotFoundError later; stage-2 dev needs dev weights.
-            candidate_dev = model_path / "ltx-2-19b-dev-mlx.safetensors"
+            candidate_dev = (
+                model_path / f"ltx-2-19b-dev-{bits_hint}-mlx.safetensors"
+                if bits_hint
+                else model_path / "ltx-2-19b-dev-mlx.safetensors"
+            )
             candidate_dev_fallback = model_path / "ltx-2-19b-dev.safetensors"
             if not candidate_dev.exists() and not candidate_dev_fallback.exists():
                 raise ValueError(
@@ -2739,9 +3102,24 @@ def generate_video(
                     stage2_path = model_path if stage2_model_repo is None else get_model_path(stage2_model_repo)
                     stage2_is_dev = bool(use_stage2_dev)
                     stage2_kind = "dev" if stage2_is_dev else "distilled"
-                    stage2_mlx_weight = stage2_path / f"ltx-2-19b-{stage2_kind}-mlx.safetensors"
-                    stage2_weight = stage2_path / f"ltx-2-19b-{stage2_kind}.safetensors"
-                    stage2_weights_path = stage2_mlx_weight if stage2_mlx_weight.exists() else stage2_weight
+
+                    stage2_repo_hint = f"{stage2_model_repo or model_repo}".lower()
+                    stage2_bits_hint: str | None = None
+                    if any(x in stage2_repo_hint for x in ("8bit", "q8", "int8")):
+                        stage2_bits_hint = "8bit"
+                    elif any(x in stage2_repo_hint for x in ("4bit", "q4", "int4")):
+                        stage2_bits_hint = "4bit"
+                    else:
+                        stage2_bits_hint = bits_hint
+
+                    stage2_candidates: list[Path] = []
+                    if stage2_bits_hint:
+                        stage2_candidates.append(
+                            stage2_path / f"ltx-2-19b-{stage2_kind}-{stage2_bits_hint}-mlx.safetensors"
+                        )
+                    stage2_candidates.append(stage2_path / f"ltx-2-19b-{stage2_kind}-mlx.safetensors")
+                    stage2_candidates.append(stage2_path / f"ltx-2-19b-{stage2_kind}.safetensors")
+                    stage2_weights_path = next((p for p in stage2_candidates if p.exists()), stage2_candidates[-1])
                     if not stage2_weights_path.exists():
                         raise FileNotFoundError(
                             f"Stage-2 weights not found at {stage2_weights_path}. "
@@ -2752,9 +3130,15 @@ def generate_video(
                         transformer = LTXModel.from_pretrained(
                             model_path=stage2_weights_path,
                             config=config,
-                            strict=False,
+                            # Stage-2 is the same architecture class as stage-1; load strictly to
+                            # avoid silent partial loads that manifest as static artifacts.
+                            strict=True,
                         )
                     console.print("[green]✓[/] Stage-2 transformer loaded")
+                    if runtime_quantize:
+                        with console.status("[magenta]🧮 Runtime quantizing stage-2 transformer...[/]", spinner="dots"):
+                            _runtime_quantize_transformer(transformer, label="stage2")
+                        console.print("[green]✓[/] Stage-2 transformer quantized")
 
         state2 = None
         if stage2_conditionings and verbose:
@@ -2820,6 +3204,7 @@ def generate_video(
                         compile_step=stage2_compile_effective,
                         compile_shapeless=compile_shapeless,
                         cfg_batch=cfg_batch,
+                        ui_phase="stage2",
                     )
                 else:
                     latents = denoise_dev(
@@ -2829,6 +3214,7 @@ def generate_video(
                         compile_step=stage2_compile_effective,
                         compile_shapeless=compile_shapeless,
                         cfg_batch=cfg_batch,
+                        ui_phase="stage2",
                     )
             else:
                 latents, audio_latents = denoise_distilled(
@@ -2839,6 +3225,7 @@ def generate_video(
                     compile_step=stage2_compile_effective,
                     compile_shapeless=compile_shapeless,
                     fp32_euler=fp32_euler,
+                    ui_phase="stage2",
                 )
         _log_memory("stage2 complete", mem_log)
 
@@ -2852,7 +3239,7 @@ def generate_video(
         if is_i2v:
             with console.status("[blue]🖼️  Loading VAE encoder and encoding image...[/]", spinner="dots"):
                 vae_encoder = load_vae_encoder(
-                    str(weight_file_path),
+                    str(_resolve_vae_source()),
                     weights_override=_unified_subset("vae_encoder."),
                 )
                 mx.eval(vae_encoder.parameters())
@@ -2947,6 +3334,7 @@ def generate_video(
                     compile_step=compile_step,
                     compile_shapeless=compile_shapeless,
                     cfg_batch=cfg_batch,
+                    ui_phase="dev",
                 )
             else:
                 latents = denoise_dev(
@@ -2956,6 +3344,7 @@ def generate_video(
                     compile_step=compile_step,
                     compile_shapeless=compile_shapeless,
                     cfg_batch=cfg_batch,
+                    ui_phase="dev",
                 )
         if capture_started and capture_phase in ("denoise", "all"):
             mx.metal.stop_capture()
@@ -3006,6 +3395,30 @@ def generate_video(
     else:
         console.print(f"[yellow]  Unknown tiling mode '{tiling}', using auto[/]")
         tiling_config = TilingConfig.auto(height, width, num_frames)
+
+    # Stream mode needs incremental decode so we can write the temp MP4 and emit
+    # live previews/progress. `TilingConfig.auto()` returns `None` for smaller
+    # videos, which would silently disable stream mode entirely.
+    if stream and tiling_config is None:
+        try:
+            # Choose a conservative temporal tile so overhead stays low while
+            # still producing incremental callbacks for the stream writer.
+            #
+            # Requirements: tile_size >= 16 and divisible by 8.
+            tile_size = 64
+            if num_frames < tile_size:
+                tile_size = max(16, (num_frames // 8) * 8)
+                if tile_size <= 0:
+                    tile_size = 16
+            overlap = 24 if tile_size >= 64 else 8
+            tiling_config = TilingConfig.temporal_only(tile_size=tile_size, overlap=overlap)
+            console.print(
+                f"[dim]  Stream enabled: forcing temporal tiling ({tile_size}f/{overlap}f) for incremental decode[/]"
+            )
+        except Exception:
+            # Fallback to default temporal tiling if something goes wrong.
+            tiling_config = TilingConfig.temporal_only()
+            console.print("[dim]  Stream enabled: forcing temporal tiling for incremental decode[/]")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3204,6 +3617,15 @@ def generate_video(
                                 img.save(str(tmp), format="JPEG", quality=preview_quality, optimize=True)
                                 os.replace(str(tmp), str(preview_path))
                                 last_preview_idx = idx
+                                _ui_event(
+                                    {
+                                        "kind": "progress",
+                                        "phase": "decode",
+                                        "current": int(idx + 1),
+                                        "total": int(num_frames),
+                                        "percent": 100.0 * float(idx + 1) / float(max(1, num_frames)),
+                                    }
+                                )
                             except Exception:
                                 pass
     else:
@@ -3372,8 +3794,26 @@ def generate_video(
             inferred_audio_repo = audio_model_repo
             if inferred_audio_repo is None:
                 inferred_audio_repo = model_repo
-                if "distilled" in str(model_repo).lower() and "dev" not in str(model_repo).lower():
+                # If `model_repo` is a local directory (common in Pinokio / HF cache snapshots),
+                # do NOT try to "infer" another repo by string replacing paths. That can easily
+                # fabricate non-existent snapshot paths and crash HF validation.
+                #
+                # Only apply the distilled->dev inference when `model_repo` looks like a HF repo id.
+                try:
+                    _mr_path = Path(str(model_repo)).expanduser()
+                    _is_local_repo = _mr_path.exists() and _mr_path.is_dir()
+                except Exception:
+                    _is_local_repo = False
+
+                if (not _is_local_repo) and "distilled" in str(model_repo).lower() and "dev" not in str(model_repo).lower():
                     inferred_audio_repo = str(model_repo).replace("distilled", "dev")
+
+                # If we're doing runtime quantization (to avoid broken / bloated pre-quant
+                # snapshots), do NOT infer audio weights from the AITRADER repos. Those
+                # snapshots can be extremely large and may include duplicate variants.
+                # Use the known-good Dev BF16 checkpoint and quantize it at runtime.
+                if runtime_quantize:
+                    inferred_audio_repo = "mlx-community/LTX-2-dev-bf16"
 
             audio_model_path = get_model_path(inferred_audio_repo, require_files=False)
             audio_weight_candidates = [
@@ -3424,6 +3864,11 @@ def generate_video(
                     )
                 console.print("[green]✓[/] Audio transformer loaded")
 
+                # Keep audio generation consistent with the runtime-quantized video path:
+                # avoid downloading or relying on pre-quant AITRADER snapshots.
+                if runtime_quantize:
+                    _runtime_quantize_transformer(audio_transformer, label="audio")
+
                 # Reset seed so audio is reproducible regardless of video sampling.
                 mx.random.seed(seed)
                 audio_positions_sep = create_audio_position_grid(1, audio_frames)
@@ -3443,6 +3888,7 @@ def generate_video(
                     compile_step=False,
                     compile_shapeless=False,
                     fp32_euler=fp32_euler,
+                    ui_phase="audio",
                 )
                 del audio_transformer
                 mx.clear_cache()
