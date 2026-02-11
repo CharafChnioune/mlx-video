@@ -95,7 +95,8 @@ class _PhaseTimer:
 
 
 def _debug_enabled() -> bool:
-    return os.environ.get("LTX_DEBUG") == "1"
+    # Keep backward compatibility with older local wrappers that used MLX_VIDEO_DEBUG.
+    return os.environ.get("LTX_DEBUG") == "1" or os.environ.get("MLX_VIDEO_DEBUG") == "1"
 
 
 def _debug_log(message: str) -> None:
@@ -3588,6 +3589,15 @@ def generate_video(
                                 img.save(str(tmp), format="JPEG", quality=preview_quality, optimize=True)
                                 os.replace(str(tmp), str(preview_path))
                                 last_preview_idx = idx
+                                _ui_event(
+                                    {
+                                        "kind": "progress",
+                                        "phase": "decode",
+                                        "current": int(idx + 1),
+                                        "total": int(num_frames),
+                                        "percent": 100.0 * float(idx + 1) / float(max(1, num_frames)),
+                                    }
+                                )
                             except Exception:
                                 pass
             elif stream_cv2 is not None:
