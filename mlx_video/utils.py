@@ -42,7 +42,14 @@ def _has_required_files(path: Path) -> bool:
     return all((path / rel).exists() for rel in _required_model_files())
 
 def _needs_connectors(repo_id: str) -> bool:
-    return str(repo_id).startswith("AITRADER/ltx2-")
+    return str(repo_id).lower().startswith("aitrader/ltx2-")
+
+
+def _resolve_hf_token() -> Optional[str]:
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if token and token.strip():
+        return token.strip()
+    return None
 
 class _PinokioTqdm(_tqdm):
     """Progress bar that remains visible even when stdout isn't a TTY.
@@ -68,7 +75,11 @@ class _PinokioTqdm(_tqdm):
         super().__init__(*args, **kwargs)
 
 
-def get_model_path(model_repo: str, require_files: bool = True):
+def get_model_path(
+    model_repo: str,
+    require_files: bool = True,
+    text_encoder_only: bool = False,
+):
     """Get or download model path.
     
     Args:
@@ -83,6 +94,7 @@ def get_model_path(model_repo: str, require_files: bool = True):
     if local_path.exists() and local_path.is_dir():
         return local_path
     
+    hf_token = _resolve_hf_token()
     remote_sha: str | None = None
     try:
         # If we have a local cached snapshot but the upstream repo moved, using the
@@ -90,7 +102,7 @@ def get_model_path(model_repo: str, require_files: bool = True):
         # duplicate weight sets). Prefer the latest commit when online.
         from huggingface_hub import HfApi
 
-        remote_sha = HfApi().model_info(repo_id=alias, files_metadata=False).sha
+        remote_sha = HfApi().model_info(repo_id=alias, files_metadata=False, token=hf_token).sha
     except Exception:
         remote_sha = None
 
@@ -119,7 +131,6 @@ def get_model_path(model_repo: str, require_files: bool = True):
     # Hugging Face Hub now uses `hf-xet` under the hood for fast transfers. In "high performance"
     # mode it can improve throughput for large model snapshots. Users can override in ENVIRONMENT.
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    hf_token = os.environ.get("HF_TOKEN") or None
     # Keep downloads tight: avoid grabbing unrelated (huge) files from repos like `Lightricks/LTX-2`.
     #
     # NOTE: Some model repos (including several community conversions) accidentally include
@@ -195,7 +206,71 @@ def get_model_path(model_repo: str, require_files: bool = True):
             "ltx2-*.safetensors",
         ]
 
-    if require_files:
+    if text_encoder_only:
+        # Text-encoder-only fetch mode.
+        #
+        # This avoids accidental downloads of full video model checkpoints when resolving
+        # a text encoder repo (for example with Lightricks/LTX-2). We intentionally keep
+        # patterns narrow to tokenizer + one shard set.
+        allow_patterns = [
+            "*.json",
+            "*.model",
+            "*.jinja",
+            ".gitattributes",
+            "tokenizer/*",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "generation_config.json",
+            "text_encoder/config.json",
+            "text_encoder/generation_config.json",
+        ]
+        if siblings:
+            te = [p for p in siblings if p.startswith("text_encoder/") and p.endswith(".safetensors")]
+            has_diffusers = any(p.startswith("text_encoder/diffusion_pytorch_model") for p in te)
+            has_model = any(p.startswith("text_encoder/model") for p in te)
+            if has_diffusers:
+                allow_patterns.extend(
+                    [
+                        "text_encoder/diffusion_pytorch_model*.safetensors",
+                        "text_encoder/diffusion_pytorch_model.safetensors.index.json",
+                    ]
+                )
+                if has_model:
+                    ignore_patterns.extend(
+                        [
+                            "text_encoder/model-*.safetensors",
+                            "text_encoder/model.safetensors.index.json",
+                        ]
+                    )
+            elif has_model:
+                allow_patterns.extend(
+                    [
+                        "text_encoder/model*.safetensors",
+                        "text_encoder/model.safetensors.index.json",
+                    ]
+                )
+                ignore_patterns.extend(
+                    [
+                        "text_encoder/diffusion_pytorch_model-*.safetensors",
+                        "text_encoder/diffusion_pytorch_model.safetensors.index.json",
+                    ]
+                )
+            else:
+                # Last-resort wildcard if repo metadata is unavailable/incomplete.
+                allow_patterns.extend(
+                    [
+                        "text_encoder/*.safetensors",
+                        "text_encoder/*.index.json",
+                    ]
+                )
+        else:
+            allow_patterns.extend(
+                [
+                    "text_encoder/*.safetensors",
+                    "text_encoder/*.index.json",
+                ]
+            )
+    elif require_files:
         # LTX-2 snapshots can be very large. Limit downloads to the files we need to run
         # generation and avoid pulling duplicate shard sets.
         if _needs_connectors(alias):
@@ -213,12 +288,17 @@ def get_model_path(model_repo: str, require_files: bool = True):
                 # Upscalers (required for distilled pipelines)
                 "ltx-2-spatial-upscaler-x2-1.0.safetensors",
                 "ltx-2-temporal-upscaler-x2-1.0.safetensors",
-                # Submodules used by video+audio pipelines
-                "vae/*",
-                "audio_vae/*",
-                "vocoder/*",
-                "connectors/*",
-                "latent_upsampler/*",
+                # Submodules used by video+audio pipelines (limit to weight/config files).
+                "vae/*.safetensors",
+                "vae/*.json",
+                "audio_vae/*.safetensors",
+                "audio_vae/*.json",
+                "vocoder/*.safetensors",
+                "vocoder/*.json",
+                "connectors/*.safetensors",
+                "connectors/*.json",
+                "latent_upsampler/*.safetensors",
+                "latent_upsampler/*.json",
                 "scheduler/*",
             ]
         else:

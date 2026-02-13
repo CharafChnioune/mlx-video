@@ -2288,7 +2288,12 @@ def generate_video(
                 import json
                 from huggingface_hub import hf_hub_download
 
-                qmeta_file = hf_hub_download(repo_id=repo_str, filename="quantization.json")
+                hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+                qmeta_file = hf_hub_download(
+                    repo_id=repo_str,
+                    filename="quantization.json",
+                    token=hf_token,
+                )
                 with open(qmeta_file, "r") as f:
                     prefetched_qmeta = json.load(f)
                 _debug_log(f"prefetched quantization.json for {repo_str}: {prefetched_qmeta}")
@@ -2302,12 +2307,21 @@ def generate_video(
             #   artifacts ("snow"/static). Runtime quantization uses a known-good BF16 base
             #   model and quantizes deterministically on the user machine.
             #
-            # Users can opt back into the snapshot by setting `LTX_USE_PREQUANT=1`.
+            # Users can opt back into pre-quant snapshots only with an explicit
+            # two-flag override. A single `LTX_USE_PREQUANT=1` is treated as a
+            # request, but we still keep runtime quantization unless
+            # `LTX_ALLOW_UNSAFE_PREQUANT=1` is also present.
             use_prequant = os.environ.get("LTX_USE_PREQUANT", "").lower() in ("1", "true", "yes")
+            allow_unsafe_prequant = os.environ.get("LTX_ALLOW_UNSAFE_PREQUANT", "").lower() in ("1", "true", "yes")
             force_runtime = os.environ.get("LTX_FORCE_RUNTIME_QUANT", "").lower() in ("1", "true", "yes")
-            use_runtime = force_runtime or (not use_prequant)
+            use_runtime = force_runtime or (not (use_prequant and allow_unsafe_prequant))
 
             if use_runtime:
+                if use_prequant and not allow_unsafe_prequant:
+                    _debug_log(
+                        "LTX_USE_PREQUANT requested but blocked for safety; "
+                        "set LTX_ALLOW_UNSAFE_PREQUANT=1 to force snapshot mode."
+                    )
                 runtime_quantize = True
                 runtime_quantize_bits = int(preset_match.group(1))
                 if prefetched_qmeta:
@@ -2344,16 +2358,19 @@ def generate_video(
     # conversions (e.g. quantized snapshots) omit `text_encoder/` entirely and rely on
     # this fallback. Using an unrelated LLM repo here can cause huge downloads and
     # unstable "snow"/garbled generations.
-    default_text_encoder = os.environ.get("LTX_TEXT_ENCODER_REPO", "Lightricks/LTX-2")
+    default_text_encoder = os.environ.get(
+        "LTX_TEXT_ENCODER_REPO",
+        "mlx-community/LTX-2-distilled-bf16" if is_distilled_pipeline else "mlx-community/LTX-2-dev-bf16",
+    )
     if text_encoder_repo is None:
         # Prefer bundled text_encoder folder if present; otherwise fall back to default repo.
         if (model_path / "text_encoder").is_dir():
             text_encoder_path = model_path
         else:
             text_encoder_repo = default_text_encoder
-            text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
+            text_encoder_path = get_model_path(text_encoder_repo, require_files=False, text_encoder_only=True)
     else:
-        text_encoder_path = get_model_path(text_encoder_repo, require_files=False)
+        text_encoder_path = get_model_path(text_encoder_repo, require_files=False, text_encoder_only=True)
 
     _debug_log(f"text_encoder_repo={text_encoder_repo} text_encoder_path={text_encoder_path}")
     quant_meta = None
@@ -4325,6 +4342,51 @@ Examples:
             # Fewer evals reduces CPU-GPU sync overhead; distilled runs tolerate a
             # slightly higher interval.
             args.eval_interval = 2 if is_dev_cli_pipeline else 4
+
+    repo_l = str(args.model_repo or "").lower()
+    is_quant_repo = any(tag in repo_l for tag in ("4bit", "8bit", "q4", "q8", "int4", "int8"))
+    if is_quant_repo:
+        # For AITRADER quant presets prefer runtime quantization by default. This avoids
+        # occasional broken pre-quant snapshots that can produce static/snow outputs.
+        os.environ.setdefault("LTX_FORCE_RUNTIME_QUANT", "1")
+        os.environ.setdefault("LTX_USE_PREQUANT", "0")
+
+        # 4-bit benefits from a conservative quantization scope to preserve quality.
+        if "LTX_RUNTIME_QUANT_SCOPE" not in os.environ:
+            os.environ["LTX_RUNTIME_QUANT_SCOPE"] = "attn1_only" if "4bit" in repo_l else "video_core"
+
+        if args.pipeline == "dev":
+            min_steps = 28 if args.num_frames <= 65 else 24
+            if args.steps < min_steps:
+                console.print(
+                    f"[yellow]⚙️  Quantized dev safety: increasing --steps {args.steps} -> {min_steps}[/]"
+                )
+                args.steps = min_steps
+        else:
+            if args.num_frames <= 33:
+                min_stage1, min_stage2 = 8, 3
+            elif args.num_frames <= 65:
+                min_stage1, min_stage2 = 6, 2
+            else:
+                min_stage1, min_stage2 = 5, 1
+
+            if args.stage1_steps < min_stage1:
+                console.print(
+                    f"[yellow]⚙️  Quantized distilled safety: increasing --stage1-steps {args.stage1_steps} -> {min_stage1}[/]"
+                )
+                args.stage1_steps = min_stage1
+            if args.stage2_steps < min_stage2:
+                console.print(
+                    f"[yellow]⚙️  Quantized distilled safety: increasing --stage2-steps {args.stage2_steps} -> {min_stage2}[/]"
+                )
+                args.stage2_steps = min_stage2
+
+            if args.num_frames <= 33 and args.sigma_subsample == "farthest":
+                # Very short clips are less stable with aggressive farthest-point subsampling.
+                args.sigma_subsample = "uniform"
+                console.print(
+                    "[yellow]⚙️  Quantized distilled safety: using --sigma-subsample uniform for short clip[/]"
+                )
 
     if args.frame_rate is not None:
         args.fps = args.frame_rate
