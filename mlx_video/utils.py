@@ -95,21 +95,23 @@ def get_model_path(
         return local_path
     
     hf_token = _resolve_hf_token()
+    # Avoid expensive/implicit "auto-update" behavior for huge checkpoints:
+    # prefer using the local cached snapshot if it has the required files.
+    # Users can force a refresh by setting `LTX_HF_REFRESH=1`.
     remote_sha: str | None = None
-    try:
-        # If we have a local cached snapshot but the upstream repo moved, using the
-        # cached copy can be massively wasteful (old snapshots sometimes contained
-        # duplicate weight sets). Prefer the latest commit when online.
-        from huggingface_hub import HfApi
+    refresh = os.environ.get("LTX_HF_REFRESH", "").strip().lower() in ("1", "true", "yes")
+    if refresh:
+        try:
+            from huggingface_hub import HfApi
 
-        remote_sha = HfApi().model_info(repo_id=alias, files_metadata=False, token=hf_token).sha
-    except Exception:
-        remote_sha = None
+            remote_sha = HfApi().model_info(repo_id=alias, files_metadata=False, token=hf_token).sha
+        except Exception:
+            remote_sha = None
 
     local: Path | None = None
     try:
         local = Path(snapshot_download(repo_id=alias, local_files_only=True))
-        if remote_sha and local.name != remote_sha:
+        if refresh and remote_sha and local.name != remote_sha:
             # Stale cached snapshot: force a refresh download below.
             local = None
         if local is not None and require_files and not _has_required_files(local):

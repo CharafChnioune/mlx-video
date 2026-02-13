@@ -135,15 +135,29 @@ def _debug_weights_summary(label: str, weights_path: Optional[Path]) -> None:
         if not weights_path.exists():
             _debug_log(f"{label}: missing {weights_path}")
             return
-        weights = mx.load(str(weights_path))
-        total = len(weights)
-        scales = sum(1 for k in weights if k.endswith(".scales"))
-        biases = sum(1 for k in weights if k.endswith(".biases"))
-        dtypes = {}
-        for v in weights.values():
-            key = str(v.dtype)
-            dtypes[key] = dtypes.get(key, 0) + 1
-        _debug_log(f"{label}: {weights_path} keys={total} scales={scales} biases={biases} dtypes={dtypes}")
+        # Avoid `mx.load()` here: it materializes the full weight dict and can double peak
+        # memory on large checkpoints. Parse the safetensors header instead.
+        if weights_path.suffix.lower() == ".safetensors":
+            import json
+            import struct
+
+            with open(weights_path, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            keys = [k for k in header.keys() if k != "__metadata__"]
+            scales = sum(1 for k in keys if k.endswith(".scales") or k.endswith("scales"))
+            biases = sum(1 for k in keys if k.endswith(".biases") or k.endswith("biases") or k.endswith(".zeros") or k.endswith("zeros"))
+            dtypes: dict[str, int] = {}
+            for k, meta in header.items():
+                if k == "__metadata__":
+                    continue
+                dt = str((meta or {}).get("dtype", ""))
+                dtypes[dt] = dtypes.get(dt, 0) + 1
+            _debug_log(
+                f"{label}: {weights_path} keys={len(keys)} scales={scales} biases/zeros={biases} dtypes={dtypes}"
+            )
+        else:
+            _debug_log(f"{label}: {weights_path} (non-safetensors)")
     except Exception as exc:
         _debug_log(f"{label}: <failed to load> {exc}")
 
@@ -2300,28 +2314,27 @@ def generate_video(
             except Exception as exc:
                 _debug_log(f"prefetch quantization.json failed for {repo_str}: {exc}")
 
-            # Default to runtime quantization for known 4/8-bit preset repos.
+            # Prefer the pre-quantized snapshot by default for preset repos.
             #
-            # Rationale:
-            # - Some community "pre-quantized" snapshots are enormous and/or yield severe
-            #   artifacts ("snow"/static). Runtime quantization uses a known-good BF16 base
-            #   model and quantizes deterministically on the user machine.
-            #
-            # Users can opt back into pre-quant snapshots only with an explicit
-            # two-flag override. A single `LTX_USE_PREQUANT=1` is treated as a
-            # request, but we still keep runtime quantization unless
-            # `LTX_ALLOW_UNSAFE_PREQUANT=1` is also present.
-            use_prequant = os.environ.get("LTX_USE_PREQUANT", "").lower() in ("1", "true", "yes")
-            allow_unsafe_prequant = os.environ.get("LTX_ALLOW_UNSAFE_PREQUANT", "").lower() in ("1", "true", "yes")
-            force_runtime = os.environ.get("LTX_FORCE_RUNTIME_QUANT", "").lower() in ("1", "true", "yes")
-            use_runtime = force_runtime or (not (use_prequant and allow_unsafe_prequant))
+            # Runtime quantization is still supported (and useful as a fallback), but it
+            # necessarily starts from a BF16 base checkpoint, which can look like "it's
+            # still BF16" in memory monitors during load. Users can force runtime mode
+            # via `LTX_FORCE_RUNTIME_QUANT=1` (or disable prequant via `LTX_USE_PREQUANT=0`).
+            use_prequant_raw = os.environ.get("LTX_USE_PREQUANT", "").strip().lower()
+            force_runtime = os.environ.get("LTX_FORCE_RUNTIME_QUANT", "").strip().lower() in ("1", "true", "yes")
+            if use_prequant_raw in ("0", "false", "no"):
+                force_runtime = True
 
-            if use_runtime:
-                if use_prequant and not allow_unsafe_prequant:
-                    _debug_log(
-                        "LTX_USE_PREQUANT requested but blocked for safety; "
-                        "set LTX_ALLOW_UNSAFE_PREQUANT=1 to force snapshot mode."
-                    )
+            if not force_runtime:
+                bits_label = preset_match.group(1)
+                console.print(f"[dim]Quant: using pre-quantized {bits_label}-bit weights from {repo_str}[/]")
+                model_path = get_model_path(model_repo)
+                # If the preset repo is missing quantization metadata, fall back to runtime quant.
+                if not (model_path / "quantization.json").exists():
+                    _debug_log(f"preset repo missing quantization.json; falling back to runtime quantization: {repo_str}")
+                    force_runtime = True
+
+            if force_runtime:
                 runtime_quantize = True
                 runtime_quantize_bits = int(preset_match.group(1))
                 if prefetched_qmeta:
@@ -2337,15 +2350,15 @@ def generate_video(
                     "LTX_RUNTIME_QUANT_BASE_REPO",
                     "mlx-community/LTX-2-distilled-bf16" if is_distilled_pipeline else "mlx-community/LTX-2-dev-bf16",
                 )
+                console.print(
+                    f"[dim]Quant: runtime quantization enabled ({runtime_quantize_bits}-bit) from base repo {base_repo}[/]"
+                )
                 _debug_log(
                     f"runtime_quantize(preset): repo={repo_str} "
                     f"bits={runtime_quantize_bits} group_size={runtime_quantize_group_size} "
                     f"mode={runtime_quantize_mode} scope={runtime_quantize_scope} base_repo={base_repo}"
                 )
                 model_path = get_model_path(base_repo)
-            else:
-                _debug_log(f"using pre-quantized snapshot as-is: repo={repo_str}")
-                model_path = get_model_path(model_repo)
         else:
             model_path = get_model_path(model_repo)
 
@@ -4346,13 +4359,19 @@ Examples:
     repo_l = str(args.model_repo or "").lower()
     is_quant_repo = any(tag in repo_l for tag in ("4bit", "8bit", "q4", "q8", "int4", "int8"))
     if is_quant_repo:
-        # For AITRADER quant presets prefer runtime quantization by default. This avoids
-        # occasional broken pre-quant snapshots that can produce static/snow outputs.
-        os.environ.setdefault("LTX_FORCE_RUNTIME_QUANT", "1")
-        os.environ.setdefault("LTX_USE_PREQUANT", "0")
+        # Default to using the pre-quantized snapshot for 4/8-bit model repos.
+        #
+        # If a given community snapshot is broken on a user's machine (e.g. "snow"/static),
+        # they can force runtime quantization from a BF16 base checkpoint by setting:
+        #   LTX_FORCE_RUNTIME_QUANT=1
+        force_runtime = os.environ.get("LTX_FORCE_RUNTIME_QUANT", "").strip().lower() in ("1", "true", "yes")
+        use_prequant_raw = os.environ.get("LTX_USE_PREQUANT", "").strip().lower()
+        if use_prequant_raw in ("0", "false", "no"):
+            force_runtime = True
 
-        # 4-bit benefits from a conservative quantization scope to preserve quality.
-        if "LTX_RUNTIME_QUANT_SCOPE" not in os.environ:
+        # Runtime quantization scope only applies when runtime quant is enabled.
+        if force_runtime and "LTX_RUNTIME_QUANT_SCOPE" not in os.environ:
+            # 4-bit benefits from a conservative scope to preserve quality.
             os.environ["LTX_RUNTIME_QUANT_SCOPE"] = "attn1_only" if "4bit" in repo_l else "video_core"
 
         if args.pipeline == "dev":
