@@ -244,7 +244,7 @@ class LanguageModel(nn.Module):
                         if kk.endswith(".scales"):
                             scales_keys.add(kk)
 
-            # `apply_quantization` only needs membership tests (`f\"{p}.scales\" in weights`),
+            # `apply_quantization` only needs membership tests (`f"{p}.scales" in weights`),
             # so passing a set keeps this cheap and avoids loading tensors eagerly.
             apply_quantization(model=language_model, weights=scales_keys, quantization=quantization)
 

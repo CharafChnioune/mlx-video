@@ -2208,6 +2208,11 @@ def generate_video(
     if sigma_subsample not in ("uniform", "farthest"):
         raise ValueError("--sigma-subsample must be 'uniform' or 'farthest'.")
 
+    # Heuristic for quantized model repos (4/8-bit). We use this early to pick
+    # safer/cheaper defaults (audio mode, CFG batching) before weights are loaded.
+    repo_l = str(model_repo or "").lower()
+    is_quant_repo = any(tag in repo_l for tag in ("4bit", "8bit", "q4", "q8", "int4", "int8"))
+
     audio_mode = (audio_mode or "auto").lower()
     if audio_mode not in ("auto", "joint", "separate"):
         raise ValueError("--audio-mode must be one of: auto, joint, separate")
@@ -2219,7 +2224,17 @@ def generate_video(
         if audio_mode == "auto":
             # Distilled audio latents are often tonal; separate audio uses a dev
             # AudioOnly transformer and tends to be less "zoom"-like.
-            audio_mode_effective = "separate" if pipeline != PipelineType.DEV else "joint"
+            if pipeline != PipelineType.DEV:
+                audio_mode_effective = "separate"
+            else:
+                # For quantized dev repos, joint AudioVideo models are heavy and can
+                # amplify instability; default to separate audio for lower peak memory.
+                audio_mode_effective = "separate" if is_quant_repo else "joint"
+                if is_quant_repo and verbose:
+                    console.print(
+                        "[yellow]⚙️  Quant audio: using --audio-mode separate (lower memory). "
+                        "Use --audio-mode joint to override.[/]"
+                    )
         else:
             audio_mode_effective = audio_mode
         joint_audio = audio_mode_effective == "joint"
@@ -2273,6 +2288,11 @@ def generate_video(
     runtime_quantize_mode = str(os.environ.get("LTX_RUNTIME_QUANT_MODE", "affine"))
     runtime_quantize_scope = str(os.environ.get("LTX_RUNTIME_QUANT_SCOPE", "video_core"))
     prefetched_quant_meta: dict | None = None
+    clear_cache_after_quant = os.environ.get("LTX_CLEAR_CACHE_AFTER_QUANT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
 
     # Get model path (HF repo or local directory)
     explicit_weight_path = None
@@ -2314,18 +2334,36 @@ def generate_video(
             except Exception as exc:
                 _debug_log(f"prefetch quantization.json failed for {repo_str}: {exc}")
 
-            # Prefer the pre-quantized snapshot by default for preset repos.
-            #
-            # Runtime quantization is still supported (and useful as a fallback), but it
-            # necessarily starts from a BF16 base checkpoint, which can look like "it's
-            # still BF16" in memory monitors during load. Users can force runtime mode
-            # via `LTX_FORCE_RUNTIME_QUANT=1` (or disable prequant via `LTX_USE_PREQUANT=0`).
             use_prequant_raw = os.environ.get("LTX_USE_PREQUANT", "").strip().lower()
             force_runtime = os.environ.get("LTX_FORCE_RUNTIME_QUANT", "").strip().lower() in ("1", "true", "yes")
+            force_prequant = use_prequant_raw in ("1", "true", "yes")
             if use_prequant_raw in ("0", "false", "no"):
                 force_runtime = True
 
-            if not force_runtime:
+            # Default behavior for known 4/8-bit preset repos:
+            # - AITRADER snapshots have been observed to produce heavy "snow"/static.
+            # - Prefer runtime quantization from the official BF16 checkpoints unless
+            #   the user explicitly asks for the snapshot.
+            if (not force_runtime) and (not force_prequant) and str(repo_str).lower().startswith("aitrader/"):
+                force_runtime = True
+                console.print(
+                    f"[yellow]⚙️  Quant: defaulting to runtime quantization for {repo_str} "
+                    "(pre-quant snapshot can cause 'snow'). Use --quantization prequant or "
+                    "LTX_USE_PREQUANT=1 to force snapshot.[/]"
+                )
+
+            if (not force_runtime) and force_prequant:
+                bits_label = preset_match.group(1)
+                console.print(f"[dim]Quant: using pre-quantized {bits_label}-bit weights from {repo_str}[/]")
+                model_path = get_model_path(model_repo)
+                # If the preset repo is missing quantization metadata, fall back to runtime quant.
+                if not (model_path / "quantization.json").exists():
+                    _debug_log(f"preset repo missing quantization.json; falling back to runtime quantization: {repo_str}")
+                    force_runtime = True
+
+            if (not force_runtime) and (not force_prequant):
+                # Back-compat default for non-AITRADER preset repos: still prefer prequant
+                # unless the user opts into runtime quantization.
                 bits_label = preset_match.group(1)
                 console.print(f"[dim]Quant: using pre-quantized {bits_label}-bit weights from {repo_str}[/]")
                 model_path = get_model_path(model_repo)
@@ -2345,6 +2383,10 @@ def generate_video(
                     # Some conversions used "core" to mean "video core" (not including audio blocks).
                     if runtime_quantize_scope == "core":
                         runtime_quantize_scope = "video_core"
+                # If the repo indicates 4-bit and the user didn't choose a scope,
+                # prefer a conservative quantization set to preserve quality.
+                if runtime_quantize_bits == 4 and "LTX_RUNTIME_QUANT_SCOPE" not in os.environ and not prefetched_qmeta:
+                    runtime_quantize_scope = "attn1_only"
 
                 base_repo = os.environ.get(
                     "LTX_RUNTIME_QUANT_BASE_REPO",
@@ -2935,6 +2977,9 @@ def generate_video(
                 _runtime_quantize_transformer(transformer, label="stage1")
         console.print("[green]✓[/] Stage-1 transformer quantized")
         _log_memory("stage1 transformer quantized", mem_log)
+        if clear_cache_after_quant:
+            mx.clear_cache()
+            _log_memory("stage1 quant cache cleared", mem_log)
 
     # ==========================================================================
     # Pipeline-specific generation logic
@@ -3170,6 +3215,10 @@ def generate_video(
                         with console.status("[magenta]🧮 Runtime quantizing stage-2 transformer...[/]", spinner="dots"):
                             _runtime_quantize_transformer(transformer, label="stage2")
                         console.print("[green]✓[/] Stage-2 transformer quantized")
+                        _log_memory("stage2 transformer quantized", mem_log)
+                        if clear_cache_after_quant:
+                            mx.clear_cache()
+                            _log_memory("stage2 quant cache cleared", mem_log)
 
         state2 = None
         if stage2_conditionings and verbose:
@@ -3908,6 +3957,8 @@ def generate_video(
                 # avoid downloading or relying on pre-quant AITRADER snapshots.
                 if runtime_quantize:
                     _runtime_quantize_transformer(audio_transformer, label="audio")
+                    if clear_cache_after_quant:
+                        mx.clear_cache()
 
                 # Reset seed so audio is reproducible regardless of video sampling.
                 mx.random.seed(seed)
@@ -4146,6 +4197,21 @@ Examples:
     parser.add_argument("--checkpoint-path", "--checkpoint", type=str, default=None, help="Path to .safetensors checkpoint (optional)")
     parser.add_argument("--gemma-root", "--text-encoder-path", type=str, default=None, help="Path to Gemma text encoder directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logs (equivalent to setting LTX_DEBUG=1).",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        choices=["auto", "prequant", "runtime"],
+        default=os.getenv("LTX_QUANTIZATION", "auto"),
+        help=(
+            "Quantization strategy for 4/8-bit preset repos: "
+            "auto (default), prequant (use snapshot), runtime (quantize BF16 base)."
+        ),
+    )
     parser.add_argument("--profile", action="store_true", help="Print a timing breakdown for benchmarking")
     parser.add_argument(
         "--profile-json",
@@ -4333,6 +4399,18 @@ Examples:
     parser.add_argument("--stg-mode", type=str, choices=["stg_av", "stg_v"], default=None, help="(PyTorch parity) Not implemented in MLX; ignored.")
     args = parser.parse_args()
 
+    if args.debug:
+        # Enable debug output across modules (LTXModel + generate.py).
+        os.environ["LTX_DEBUG"] = "1"
+        os.environ.setdefault("MLX_VIDEO_DEBUG", "1")
+
+    if args.quantization == "runtime":
+        os.environ["LTX_FORCE_RUNTIME_QUANT"] = "1"
+        os.environ["LTX_USE_PREQUANT"] = "0"
+    elif args.quantization == "prequant":
+        os.environ["LTX_FORCE_RUNTIME_QUANT"] = "0"
+        os.environ["LTX_USE_PREQUANT"] = "1"
+
     if args.profile_json and not args.profile:
         args.profile = True
 
@@ -4437,7 +4515,7 @@ Examples:
         args.cfg_batch = False
     elif env_cfg_batch:
         args.cfg_batch = True
-    elif not args.cfg_batch and is_dev_cli_pipeline and args.cfg_scale > 1.0:
+    elif not args.cfg_batch and is_dev_cli_pipeline and args.cfg_scale > 1.0 and not is_quant_repo:
         args.cfg_batch = True
 
     auto_output_name_model = None
