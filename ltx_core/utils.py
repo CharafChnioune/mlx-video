@@ -8,7 +8,7 @@ from mlx_video.utils import rms_norm as _mlx_rms_norm
 def rms_norm(x: mx.array, weight: mx.array | None = None, eps: float = 1e-6) -> mx.array:
     """MLX RMS normalization.
 
-    If weight is provided, applies it after normalization (matching torch.rms_norm).
+    If weight is provided, applies it after normalization (scale-only RMSNorm).
     """
     if weight is None:
         return _mlx_rms_norm(x, eps=eps)

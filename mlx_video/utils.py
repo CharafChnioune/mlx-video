@@ -412,7 +412,7 @@ def to_denoised(
     Given noisy input x_t and velocity prediction v, compute denoised x_0:
     x_0 = x_t - sigma * v
 
-    Uses float32 for computation precision (matching PyTorch behavior),
+    Uses float32 for computation precision,
     then converts back to input dtype.
 
     Args:
@@ -425,7 +425,7 @@ def to_denoised(
     """
     original_dtype = noisy.dtype
 
-    # Cast to float32 for precision (PyTorch uses calc_dtype=torch.float32)
+    # Cast to float32 for precision.
     noisy_f32 = noisy.astype(mx.float32)
     velocity_f32 = velocity.astype(mx.float32)
 
@@ -441,7 +441,7 @@ def to_denoised(
 
 
 def repeat_interleave(x: mx.array, repeats: int, axis: int = -1) -> mx.array:
-    """Repeat elements of tensor along an axis, similar to torch.repeat_interleave.
+    """Repeat elements of a tensor along an axis.
 
     Args:
         x: Input tensor

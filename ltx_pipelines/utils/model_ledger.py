@@ -18,10 +18,10 @@ from mlx_video.utils import get_model_path
 
 class ModelLedger:
     """
-    MLX-native model ledger that mirrors the PyTorch API but loads MLX models.
+    MLX-native model ledger that mirrors the legacy pipeline API but loads MLX models.
 
     This class is a lightweight compatibility layer so older pipeline code can
-    run on Apple Silicon without CUDA or torch.
+    run on Apple Silicon without CUDA.
     """
 
     def __init__(

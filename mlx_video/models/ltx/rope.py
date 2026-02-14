@@ -78,11 +78,8 @@ def apply_interleaved_rotary_emb(
 def rotate_half_interleaved(x: mx.array) -> mx.array:
     """Rotate for interleaved RoPE: [x0, x1, x2, x3] -> [-x1, x0, -x3, x2].
 
-    PyTorch equivalent:
-        t_dup = rearrange(x, "... (d r) -> ... d r", r=2)
-        t1, t2 = t_dup.unbind(dim=-1)
-        t_dup = torch.stack((-t2, t1), dim=-1)
-        return rearrange(t_dup, "... d r -> ... (d r)")
+    Equivalent to reshaping into pairs, swapping, negating the odd part, then
+    flattening back.
     """
     # x: (..., dim) where dim is even
     x_even = x[..., 0::2]  # [x0, x2, x4, ...]

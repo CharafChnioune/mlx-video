@@ -1936,9 +1936,21 @@ def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RA
         wf.writeframes(audio_int16.tobytes())
 
 
-def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
+def mux_video_audio(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    *,
+    audio_bitrate: str = "256k",
+    audio_filter: Optional[str] = None,
+    audio_sample_rate: int = AUDIO_SAMPLE_RATE,
+):
     """Combine video and audio into final output using ffmpeg."""
     import subprocess
+
+    af = (audio_filter or "").strip()
+    if af.lower() in {"none", "off", "false", "0"}:
+        af = ""
 
     cmd = [
         "ffmpeg", "-y",
@@ -1950,12 +1962,19 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
         "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "aac",
+        "-b:a", str(audio_bitrate),
+        "-ar", str(audio_sample_rate),
+        "-ac", "2",
         # Do NOT use -shortest here. Audio generation may be slightly shorter
         # than the video duration due to hop-size rounding, and -shortest will
         # truncate the video (dropping last frames).
         "-movflags", "+faststart",
         str(output_path)
     ]
+    if af:
+        # Apply cleanup/denoise during mux so the MP4 always has the improved audio.
+        movflags_idx = cmd.index("-movflags")
+        cmd[movflags_idx:movflags_idx] = ["-af", af]
 
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -2009,6 +2028,8 @@ def generate_video(
     audio_model_repo: Optional[str] = None,
     audio_steps: int = 8,
     output_audio_path: Optional[str] = None,
+    audio_bitrate: str = "256k",
+    audio_filter: Optional[str] = None,
     mem_log: bool = False,
     clear_cache: bool = False,
     cache_limit_gb: Optional[float] = None,
@@ -4015,7 +4036,14 @@ def generate_video(
                         console.print(f"[yellow]⚠️  Temp video missing; re-encoding to {temp_video_path}[/]")
                         with phase_timer.phase("video_write"):
                             _write_video(video_np, temp_video_path, fps, console=console, encoder=video_encoder)
-                    success = mux_video_audio(temp_video_path, audio_path, output_path)
+                    success = mux_video_audio(
+                        temp_video_path,
+                        audio_path,
+                        output_path,
+                        audio_bitrate=audio_bitrate,
+                        audio_filter=audio_filter,
+                        audio_sample_rate=AUDIO_SAMPLE_RATE,
+                    )
             if success:
                 console.print(f"[green]✅ Saved video with audio to[/] {output_path}")
                 if temp_video_path.exists() and temp_video_path != output_path:
@@ -4343,6 +4371,25 @@ Examples:
         default=int(os.getenv("LTX_AUDIO_STEPS", "8")),
         help="Number of denoising steps for separate audio generation (1-8).",
     )
+    parser.add_argument(
+        "--audio-bitrate",
+        type=str,
+        default=os.getenv("LTX_AUDIO_BITRATE", "256k"),
+        help="AAC bitrate used when muxing audio into MP4 (default: 256k).",
+    )
+    parser.add_argument(
+        "--audio-filter",
+        type=str,
+        default=os.getenv(
+            "LTX_AUDIO_FILTER",
+            # Default: remove low-frequency rumble + aggressively notch common mains hum bands (50/60Hz + harmonics).
+            "highpass=f=30,"
+            "equalizer=f=50:t=q:w=3:g=-30,equalizer=f=60:t=q:w=3:g=-30,"
+            "equalizer=f=100:t=q:w=3:g=-30,equalizer=f=120:t=q:w=3:g=-30,"
+            "equalizer=f=150:t=q:w=3:g=-30,equalizer=f=180:t=q:w=3:g=-30",
+        ),
+        help="FFmpeg -af filter chain applied during mux. Use 'none' to disable.",
+    )
     parser.add_argument("--skip-audio", action="store_true", help="Alias for disabling audio generation")
     parser.add_argument("--output-audio", type=str, default=None, help="Output audio path")
     parser.add_argument("--mem-log", action="store_true", help="Log active/cache/peak memory at key stages")
@@ -4611,6 +4658,8 @@ Examples:
         audio_model_repo=args.audio_model_repo,
         audio_steps=args.audio_steps,
         output_audio_path=args.output_audio,
+        audio_bitrate=args.audio_bitrate,
+        audio_filter=args.audio_filter,
         mem_log=args.mem_log,
         clear_cache=args.clear_cache,
         cache_limit_gb=args.cache_limit_gb,

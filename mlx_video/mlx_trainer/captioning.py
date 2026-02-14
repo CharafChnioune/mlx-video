@@ -23,16 +23,16 @@ class MlxCaptionConfig:
 
 
 class Captioner:
-    """Torch/Transformers captioner placeholder (not supported in MLX-only mode)."""
+    """Non-MLX captioner placeholder (not supported in MLX-only mode)."""
 
     def __init__(self, cfg: CaptionConfig | None = None) -> None:
         self.cfg = cfg or CaptionConfig()
 
     def caption(self, frame: np.ndarray) -> str:  # pragma: no cover
-        raise RuntimeError("Captioner requires torch/transformers; use MlxCaptioner instead.")
+        raise RuntimeError("Captioner is not supported in MLX-only mode; use MlxCaptioner instead.")
 
     def caption_batch(self, frames: List[np.ndarray]) -> List[str]:  # pragma: no cover
-        raise RuntimeError("Captioner requires torch/transformers; use MlxCaptioner instead.")
+        raise RuntimeError("Captioner is not supported in MLX-only mode; use MlxCaptioner instead.")
 
 
 class MlxCaptioner:
