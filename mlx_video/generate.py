@@ -1936,6 +1936,47 @@ def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RA
         wf.writeframes(audio_int16.tobytes())
 
 
+def filter_audio_wav(
+    input_path: Path,
+    output_path: Path,
+    *,
+    audio_filter: str,
+    audio_sample_rate: int = AUDIO_SAMPLE_RATE,
+) -> bool:
+    """Apply an FFmpeg audio filter chain to a WAV file.
+
+    We keep this separate from muxing so:
+      - the user can inspect the cleaned WAV sidecar
+      - we only apply cleanup once (instead of re-encoding in multiple places)
+    """
+    import subprocess
+
+    af = (audio_filter or "").strip()
+    if af.lower() in {"none", "off", "false", "0"}:
+        return False
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-af",
+        af,
+        "-ar",
+        str(audio_sample_rate),
+        "-ac",
+        "2",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
 def mux_video_audio(
     video_path: Path,
     audio_path: Path,
@@ -4026,8 +4067,36 @@ def generate_video(
 
             audio_path = Path(output_audio_path) if output_audio_path else output_path.with_suffix('.wav')
             with phase_timer.phase("audio_save"):
-                save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
-            console.print(f"[green]✅ Saved audio to[/] {audio_path}")
+                # Write audio sidecar. If an audio filter is enabled, keep a raw copy
+                # for debugging and write a cleaned WAV for user playback/mux.
+                audio_path_for_mux = audio_path
+                raw_path: Optional[Path] = None
+
+                af = (audio_filter or "").strip()
+                audio_filter_enabled = af and (af.lower() not in {"none", "off", "false", "0"})
+
+                if audio_filter_enabled:
+                    raw_path = audio_path.with_name(f"{audio_path.stem}.raw{audio_path.suffix}")
+                    save_audio(audio_np, raw_path, AUDIO_SAMPLE_RATE)
+                    audio_path_for_mux = raw_path
+
+                    cleaned_ok = filter_audio_wav(
+                        raw_path,
+                        audio_path,
+                        audio_filter=af,
+                        audio_sample_rate=AUDIO_SAMPLE_RATE,
+                    )
+                    if cleaned_ok:
+                        audio_path_for_mux = audio_path
+                        console.print(f"[green]✅ Saved raw audio to[/] {raw_path}")
+                        console.print(f"[green]✅ Saved cleaned audio to[/] {audio_path}")
+                    else:
+                        console.print(
+                            f"[yellow]⚠️  Audio filter failed; using raw audio for mux: {raw_path}[/]"
+                        )
+                else:
+                    save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
+                    console.print(f"[green]✅ Saved audio to[/] {audio_path}")
 
             with phase_timer.phase("audio_mux"):
                 with console.status("[blue]🎬 Combining video and audio...[/]", spinner="dots"):
@@ -4038,10 +4107,12 @@ def generate_video(
                             _write_video(video_np, temp_video_path, fps, console=console, encoder=video_encoder)
                     success = mux_video_audio(
                         temp_video_path,
-                        audio_path,
+                        audio_path_for_mux,
                         output_path,
                         audio_bitrate=audio_bitrate,
-                        audio_filter=audio_filter,
+                        # Audio may already have been cleaned into `audio_path_for_mux`.
+                        # Keep muxing filter off by default to avoid double-processing.
+                        audio_filter=None,
                         audio_sample_rate=AUDIO_SAMPLE_RATE,
                     )
             if success:
@@ -4382,11 +4453,18 @@ Examples:
         type=str,
         default=os.getenv(
             "LTX_AUDIO_FILTER",
-            # Default: remove low-frequency rumble + aggressively notch common mains hum bands (50/60Hz + harmonics).
+            # Default: keep audio natural while removing the most common artifacts:
+            # - low-frequency rumble (highpass)
+            # - narrow mains hum notches (50/60Hz + harmonics) using high Q
+            # - stronger broadband denoise (afftdn) tuned for this model's noise profile
+            #
+            # NOTE: Earlier versions used Q=3 which was *very* wide and could degrade bass.
+            # Use a high Q here to target hum without harming musical content.
             "highpass=f=30,"
-            "equalizer=f=50:t=q:w=3:g=-30,equalizer=f=60:t=q:w=3:g=-30,"
-            "equalizer=f=100:t=q:w=3:g=-30,equalizer=f=120:t=q:w=3:g=-30,"
-            "equalizer=f=150:t=q:w=3:g=-30,equalizer=f=180:t=q:w=3:g=-30",
+            "equalizer=f=50:t=q:w=50:g=-18,equalizer=f=60:t=q:w=50:g=-18,"
+            "equalizer=f=100:t=q:w=50:g=-15,equalizer=f=120:t=q:w=50:g=-15,"
+            "equalizer=f=180:t=q:w=50:g=-12,"
+            "afftdn=nr=24:nf=-45:tn=1:gs=10",
         ),
         help="FFmpeg -af filter chain applied during mux. Use 'none' to disable.",
     )
